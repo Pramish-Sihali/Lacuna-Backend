@@ -1,0 +1,32 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.17
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+pgvector==0.3.6
+
+# Document parsing and OCR
+pymupdf==1.24.13
+python-docx==1.1.2
+pytesseract==0.3.13
+Pillow==11.0.0
+
+# HTTP client for Ollama
+httpx==0.28.1
+
+# ML and clustering
+numpy==2.2.1
+scikit-learn==1.6.0
+hdbscan==0.8.40
+
+# Configuration and utilities
+python-dotenv==1.0.1
+pydantic-settings==2.6.1
+pydantic==2.10.3
+
+# Additional utilities
+aiofiles==24.1.0
