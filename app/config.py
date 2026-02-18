@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     GAP_SIMILARITY_THRESHOLD: float = 0.7
     MIN_COVERAGE_THRESHOLD: float = 0.3
 
+    # Concept Normalisation Configuration
+    # Cosine-similarity threshold above which two concepts are considered the same
+    CONCEPT_SIMILARITY_THRESHOLD: float = 0.85
+    # Relaxed threshold used when the project has fewer than
+    # CONCEPT_SMALL_PROJECT_THRESHOLD concepts
+    CONCEPT_SIMILARITY_THRESHOLD_SMALL: float = 0.80
+    # Projects with fewer concepts than this use the small-project threshold
+    CONCEPT_SMALL_PROJECT_THRESHOLD: int = 5
+
+    # Clustering Configuration (advanced)
+    # Cosine similarity above which two concepts in different clusters are linked
+    CLUSTER_BRIDGE_THRESHOLD: float = 0.60
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

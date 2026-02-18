@@ -2,6 +2,7 @@
 Database connection and session management.
 Handles PostgreSQL + pgvector setup with SQLAlchemy async engine.
 """
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool
@@ -71,7 +72,7 @@ async def init_db() -> None:
 
             # Create pgvector extension
             await conn.execute(
-                "CREATE EXTENSION IF NOT EXISTS vector"
+                text("CREATE EXTENSION IF NOT EXISTS vector")
             )
             logger.info("pgvector extension created/verified")
 

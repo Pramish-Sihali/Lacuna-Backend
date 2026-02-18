@@ -1,19 +1,33 @@
 """
-Central brain / RAG endpoints.
-"""
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-import logging
+Brain / RAG endpoints.
 
-from app.database import get_db
+Routes
+------
+POST /api/brain/build    — compute consensus scores + LLM summary → BrainBuildResponse
+POST /api/brain/chat     — RAG chat                               → BrainChatResponse
+GET  /api/brain/status   — brain state info                       → BrainStatusResponse
+POST /api/brain/rebuild  — clear + full rebuild                   → BrainBuildResponse
+"""
+import logging
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
-from app.models.database_models import BrainState, Concept, Chunk, Claim, Relationship
+from app.database import get_db
+from app.models.database_models import (
+    BrainState,
+    Concept,
+    Document,
+    Relationship,
+)
 from app.models.schemas import (
-    BrainQueryRequest,
-    BrainQueryResponse,
-    BrainStateResponse,
-    ConceptResponse
+    BrainBuildResponse,
+    BrainChatRequest,
+    BrainChatResponse,
+    BrainStatusResponse,
 )
 from app.services.brain_service import BrainService
 
@@ -22,287 +36,211 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/query", response_model=BrainQueryResponse)
-async def query_brain(
-    request: BrainQueryRequest,
-    db: AsyncSession = Depends(get_db)
-):
+# ---------------------------------------------------------------------------
+# POST /build — compute consensus + generate brain summary
+# ---------------------------------------------------------------------------
+
+@router.post("/build", response_model=BrainBuildResponse, status_code=status.HTTP_200_OK)
+async def build_brain(db: AsyncSession = Depends(get_db)):
     """
-    Query the knowledge base using RAG.
-
-    Args:
-        request: Query request with query text and parameters
-        db: Database session
-
-    Returns:
-        Query response with answer and relevant information
+    Score every concept's consensus, generate an LLM synthesis summary,
+    and persist a BrainState row.  Idempotent — calling it again updates
+    the existing BrainState in-place.
     """
     try:
-        # Get all chunks with embeddings
-        chunk_result = await db.execute(
-            select(Chunk).where(Chunk.embedding.isnot(None))
-        )
-        chunks = chunk_result.scalars().all()
-
-        # Get all concepts with embeddings
-        concept_result = await db.execute(
-            select(Concept)
-            .where(Concept.project_id == settings.DEFAULT_PROJECT_ID)
-            .where(Concept.embedding.isnot(None))
-        )
-        concepts = concept_result.scalars().all()
-
-        if not chunks and not concepts:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No indexed content found. Please upload and process documents first."
-            )
-
-        # Convert to dictionaries
-        chunk_dicts = [
-            {
-                "id": c.id,
-                "content": c.content,
-                "embedding": c.embedding,
-                "document_id": c.document_id,
-                "metadata_json": c.metadata_json
-            }
-            for c in chunks
-        ]
-
-        concept_dicts = [
-            {
-                "id": c.id,
-                "name": c.name,
-                "description": c.description,
-                "embedding": c.embedding,
-                "is_gap": c.is_gap,
-                "gap_type": c.gap_type,
-                "coverage_score": c.coverage_score
-            }
-            for c in concepts
-        ]
-
-        # Query using brain service
         brain_service = BrainService()
-        result = await brain_service.query(
-            request.query,
-            chunk_dicts,
-            concept_dicts,
+        result = await brain_service.build_brain(
+            settings.DEFAULT_PROJECT_ID, db, clear_existing=False
+        )
+        return BrainBuildResponse(
+            project_id=result.project_id,
+            concepts_scored=result.concepts_scored,
+            strong_consensus_count=result.strong_consensus_count,
+            contested_count=result.contested_count,
+            contradiction_count=result.contradiction_count,
+            summary_text=result.summary_text,
+            message=result.message,
+        )
+    except Exception as exc:
+        logger.error("build_brain error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Brain build failed: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /chat — RAG chat
+# ---------------------------------------------------------------------------
+
+@router.post("/chat", response_model=BrainChatResponse, status_code=status.HTTP_200_OK)
+async def chat(request: BrainChatRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Answer a research question using the RAG pipeline:
+    embed question → pgvector chunk search → concept lookup →
+    claim/gap context → LLM answer.
+    """
+    try:
+        brain_service = BrainService()
+        result = await brain_service.chat(
+            request.question,
+            settings.DEFAULT_PROJECT_ID,
+            db,
             top_k=request.top_k,
-            include_gaps=request.include_gaps
         )
-
-        # Convert relevant concepts to response schema
-        relevant_concepts = [
-            ConceptResponse(
-                id=c["id"],
-                project_id=settings.DEFAULT_PROJECT_ID,
-                name=c["name"],
-                description=c.get("description"),
-                generality_score=None,
-                coverage_score=c.get("coverage_score"),
-                consensus_score=None,
-                is_gap=c.get("is_gap", False),
-                gap_type=c.get("gap_type"),
-                parent_concept_id=None,
-                cluster_label=None,
-                metadata_json=None
-            )
-            for c in result["relevant_concepts"]
-        ]
-
-        # Extract document filenames
-        relevant_doc_ids = set(
-            chunk["document_id"]
-            for chunk in result["relevant_chunks"]
-            if chunk.get("document_id")
+        return BrainChatResponse(
+            question=result.question,
+            answer=result.answer,
+            sources=result.sources,
+            relevant_concepts=result.relevant_concepts,
+            confidence=result.confidence,
         )
-
-        from app.models.database_models import Document
-        doc_result = await db.execute(
-            select(Document).where(Document.id.in_(relevant_doc_ids))
-        )
-        docs = doc_result.scalars().all()
-        relevant_documents = [doc.filename for doc in docs]
-
-        return BrainQueryResponse(
-            query=result["query"],
-            answer=result["answer"],
-            relevant_concepts=relevant_concepts,
-            relevant_documents=relevant_documents,
-            confidence=result["confidence"]
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error querying brain: {e}")
+    except Exception as exc:
+        logger.error("chat error: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing query: {str(e)}"
+            detail=f"Chat failed: {exc}",
         )
 
 
-@router.get("/consensus", response_model=BrainStateResponse)
-async def get_consensus(db: AsyncSession = Depends(get_db)):
+# ---------------------------------------------------------------------------
+# GET /status — brain state info
+# ---------------------------------------------------------------------------
+
+@router.get("/status", response_model=BrainStatusResponse, status_code=status.HTTP_200_OK)
+async def get_brain_status(db: AsyncSession = Depends(get_db)):
     """
-    Get the current consensus state of the knowledge base.
-
-    Args:
-        db: Database session
-
-    Returns:
-        Brain state with consensus information
+    Return a snapshot of the knowledge base health:
+    document count, concept count, gap count, relationship count,
+    average consensus score, and a derived health score.
     """
     try:
-        # Get existing brain state
-        result = await db.execute(
+        project_id = settings.DEFAULT_PROJECT_ID
+
+        # Latest BrainState
+        brain_result = await db.execute(
             select(BrainState)
-            .where(BrainState.project_id == settings.DEFAULT_PROJECT_ID)
+            .where(BrainState.project_id == project_id)
             .order_by(BrainState.last_updated.desc())
+            .limit(1)
         )
-        brain_state = result.scalar_one_or_none()
+        brain_state: Optional[BrainState] = brain_result.scalar_one_or_none()
 
-        if brain_state:
-            return BrainStateResponse.model_validate(brain_state)
+        # Document count
+        doc_count_result = await db.execute(
+            select(func.count())
+            .select_from(Document)
+            .where(Document.project_id == project_id)
+        )
+        doc_count: int = doc_count_result.scalar() or 0
 
-        # If no brain state exists, create one
-        return BrainStateResponse(
-            id=0,
-            project_id=settings.DEFAULT_PROJECT_ID,
-            last_updated=None,
-            summary_text="No consensus data available yet.",
-            consensus_json={}
+        # Concept count (non-gap)
+        concept_count_result = await db.execute(
+            select(func.count())
+            .select_from(Concept)
+            .where(Concept.project_id == project_id, Concept.is_gap == False)
+        )
+        concept_count: int = concept_count_result.scalar() or 0
+
+        # Gap count
+        gap_count_result = await db.execute(
+            select(func.count())
+            .select_from(Concept)
+            .where(Concept.project_id == project_id, Concept.is_gap == True)
+        )
+        gap_count: int = gap_count_result.scalar() or 0
+
+        # Relationship count
+        rel_count_result = await db.execute(
+            select(func.count())
+            .select_from(Relationship)
+            .join(Concept, Relationship.source_concept_id == Concept.id)
+            .where(Concept.project_id == project_id)
+        )
+        relationship_count: int = rel_count_result.scalar() or 0
+
+        # Average consensus score across non-gap concepts
+        avg_result = await db.execute(
+            select(func.avg(Concept.consensus_score))
+            .where(
+                Concept.project_id == project_id,
+                Concept.is_gap == False,
+                Concept.consensus_score.isnot(None),
+            )
+        )
+        avg_consensus: Optional[float] = avg_result.scalar()
+
+        # Health score heuristic (0–1)
+        #   40 % — average consensus (0.5 neutral when no data)
+        #   30 % — document coverage (saturates at 10 docs)
+        #   30 % — concept richness  (saturates at 50 concepts)
+        consensus_component = float(avg_consensus) if avg_consensus is not None else 0.5
+        doc_component = min(doc_count / 10, 1.0)
+        concept_component = min(concept_count / 50, 1.0)
+        health_score = round(
+            0.40 * consensus_component
+            + 0.30 * doc_component
+            + 0.30 * concept_component,
+            4,
         )
 
-    except Exception as e:
-        logger.error(f"Error getting consensus: {e}")
+        return BrainStatusResponse(
+            project_id=project_id,
+            last_updated=brain_state.last_updated if brain_state else None,
+            doc_count=doc_count,
+            concept_count=concept_count,
+            gap_count=gap_count,
+            relationship_count=relationship_count,
+            avg_consensus=round(float(avg_consensus), 4) if avg_consensus is not None else None,
+            health_score=health_score,
+            summary_text=brain_state.summary_text if brain_state else None,
+            has_brain=brain_state is not None,
+        )
+
+    except Exception as exc:
+        logger.error("get_brain_status error: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving consensus: {str(e)}"
+            detail=f"Status check failed: {exc}",
         )
 
 
-@router.post("/build-consensus", response_model=BrainStateResponse)
-async def build_consensus(db: AsyncSession = Depends(get_db)):
+# ---------------------------------------------------------------------------
+# POST /rebuild — clear existing state and do a full rebuild
+# ---------------------------------------------------------------------------
+
+@router.post("/rebuild", response_model=BrainBuildResponse, status_code=status.HTTP_200_OK)
+async def rebuild_brain(db: AsyncSession = Depends(get_db)):
     """
-    Build consensus from current knowledge base.
-
-    Args:
-        db: Database session
-
-    Returns:
-        Updated brain state
+    Delete the existing BrainState, reset all concept consensus scores,
+    then run the full build pipeline from scratch.  Use when the document
+    collection has changed significantly.
     """
     try:
-        # Get all concepts
+        # Reset all consensus scores so stale values don't persist
         concept_result = await db.execute(
             select(Concept).where(Concept.project_id == settings.DEFAULT_PROJECT_ID)
         )
-        concepts = concept_result.scalars().all()
+        for concept in concept_result.scalars().all():
+            concept.consensus_score = None
+        await db.flush()
 
-        # Get all claims
-        claim_result = await db.execute(select(Claim))
-        all_claims = claim_result.scalars().all()
-
-        # Group claims by concept
-        claims_by_concept = {}
-        for claim in all_claims:
-            if claim.concept_id not in claims_by_concept:
-                claims_by_concept[claim.concept_id] = []
-            claims_by_concept[claim.concept_id].append({
-                "claim_text": claim.claim_text,
-                "claim_type": claim.claim_type,
-                "confidence": claim.confidence
-            })
-
-        # Get relationships
-        rel_result = await db.execute(select(Relationship))
-        relationships = rel_result.scalars().all()
-
-        # Convert to dictionaries
-        concept_dicts = [
-            {
-                "id": c.id,
-                "name": c.name,
-                "description": c.description,
-                "embedding": c.embedding,
-                "coverage_score": c.coverage_score,
-                "consensus_score": c.consensus_score
-            }
-            for c in concepts
-        ]
-
-        relationship_dicts = [
-            {
-                "source_concept_id": r.source_concept_id,
-                "target_concept_id": r.target_concept_id,
-                "relationship_type": r.relationship_type,
-                "strength": r.strength
-            }
-            for r in relationships
-        ]
-
-        # Build consensus using brain service
         brain_service = BrainService()
-        consensus = await brain_service.build_consensus(
-            concept_dicts,
-            claims_by_concept,
-            relationship_dicts
+        result = await brain_service.build_brain(
+            settings.DEFAULT_PROJECT_ID, db, clear_existing=True
         )
-
-        # Update or create brain state
-        result = await db.execute(
-            select(BrainState)
-            .where(BrainState.project_id == settings.DEFAULT_PROJECT_ID)
-            .order_by(BrainState.last_updated.desc())
+        return BrainBuildResponse(
+            project_id=result.project_id,
+            concepts_scored=result.concepts_scored,
+            strong_consensus_count=result.strong_consensus_count,
+            contested_count=result.contested_count,
+            contradiction_count=result.contradiction_count,
+            summary_text=result.summary_text,
+            message="[Rebuild] " + result.message,
         )
-        brain_state = result.scalar_one_or_none()
-
-        if brain_state:
-            brain_state.summary_text = consensus["summary"]
-            brain_state.consensus_json = {
-                "high_consensus_concepts": consensus["high_consensus_concepts"],
-                "areas_of_disagreement": consensus["areas_of_disagreement"],
-                "total_concepts": consensus["total_concepts"],
-                "avg_consensus": consensus["avg_consensus"]
-            }
-        else:
-            brain_state = BrainState(
-                project_id=settings.DEFAULT_PROJECT_ID,
-                summary_text=consensus["summary"],
-                consensus_json={
-                    "high_consensus_concepts": consensus["high_consensus_concepts"],
-                    "areas_of_disagreement": consensus["areas_of_disagreement"],
-                    "total_concepts": consensus["total_concepts"],
-                    "avg_consensus": consensus["avg_consensus"]
-                }
-            )
-            db.add(brain_state)
-
-        # Update consensus scores for concepts
-        for concept_info in consensus.get("high_consensus_concepts", []):
-            concept = next((c for c in concepts if c.id == concept_info["id"]), None)
-            if concept:
-                concept.consensus_score = concept_info["score"]
-
-        for concept_info in consensus.get("areas_of_disagreement", []):
-            concept = next((c for c in concepts if c.id == concept_info["id"]), None)
-            if concept:
-                concept.consensus_score = concept_info["score"]
-
-        await db.commit()
-        await db.refresh(brain_state)
-
-        logger.info("Consensus built successfully")
-
-        return BrainStateResponse.model_validate(brain_state)
-
-    except Exception as e:
-        logger.error(f"Error building consensus: {e}")
-        await db.rollback()
+    except Exception as exc:
+        logger.error("rebuild_brain error: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error building consensus: {str(e)}"
+            detail=f"Brain rebuild failed: {exc}",
         )

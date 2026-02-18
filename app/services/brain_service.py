@@ -1,326 +1,585 @@
 """
-Central brain service for RAG and consensus building.
-"""
-import logging
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+Brain service: consensus scoring, brain state persistence, and RAG chat.
 
-from app.services.embedding import EmbeddingService
-from app.services.llm_extractor import LLMExtractor
+Public API
+----------
+BrainService.build_brain(project_id, db, *, clear_existing=False) -> BrainBuildResult
+BrainService.chat(question, project_id, db, top_k=5)              -> ChatResult
+"""
+from __future__ import annotations
+
+import dataclasses
+import logging
+from typing import Any, Dict, List, Optional, Set
+
+import httpx
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.models.database_models import (
+    BrainState,
+    Claim,
+    ClaimType,
+    Concept,
+    Document,
+    Relationship,
+)
+from app.services.embedding import OllamaEmbeddingService
 
 logger = logging.getLogger(__name__)
 
 
-class BrainService:
-    """Central brain service for querying and consensus building."""
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
 
-    def __init__(self):
-        """Initialize brain service."""
-        self.embedding_service = EmbeddingService()
-        self.llm_extractor = LLMExtractor()
+@dataclasses.dataclass
+class ConsensusSummary:
+    """Per-project consensus breakdown produced by _score_all_concepts."""
 
-    async def query(
-        self,
-        query_text: str,
-        chunks: List[Dict[str, Any]],
-        concepts: List[Dict[str, Any]],
-        top_k: int = 5,
-        include_gaps: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Query the knowledge base using RAG.
+    strong: List[str]        # concept names, score > 0.8
+    contested: List[str]     # concept names, 0.3 <= score <= 0.8
+    contradicted: List[str]  # concept names, score < 0.3
+    avg_score: float
 
-        Args:
-            query_text: User query
-            chunks: List of document chunks with embeddings
-            concepts: List of concepts with embeddings
-            top_k: Number of top results to retrieve
-            include_gaps: Whether to include gap information
 
-        Returns:
-            Query response with answer and relevant information
-        """
-        # Generate query embedding
-        query_embedding = await self.embedding_service.generate_embedding(query_text)
+@dataclasses.dataclass
+class BrainBuildResult:
+    """Returned by BrainService.build_brain."""
 
-        if not query_embedding:
-            return {
-                "answer": "Error generating query embedding",
-                "relevant_concepts": [],
-                "relevant_chunks": [],
-                "confidence": 0.0
-            }
+    project_id: int
+    concepts_scored: int
+    strong_consensus_count: int
+    contested_count: int
+    contradiction_count: int
+    summary_text: str
+    message: str
 
-        # Find relevant chunks
-        relevant_chunks = await self._find_relevant_chunks(
-            query_embedding,
-            chunks,
-            top_k=top_k
-        )
 
-        # Find relevant concepts
-        relevant_concepts = await self._find_relevant_concepts(
-            query_embedding,
-            concepts,
-            top_k=top_k
-        )
+@dataclasses.dataclass
+class ChatResult:
+    """Returned by BrainService.chat."""
 
-        # Build context from chunks and concepts
-        context = await self._build_context(relevant_chunks, relevant_concepts)
+    question: str
+    answer: str
+    sources: List[str]            # document filenames
+    relevant_concepts: List[str]  # concept names
+    confidence: float
 
-        # Generate answer using LLM
-        answer = await self._generate_answer(query_text, context, include_gaps)
 
-        # Calculate confidence based on relevance scores
-        confidence = await self._calculate_confidence(relevant_chunks, relevant_concepts)
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
 
-        return {
-            "query": query_text,
-            "answer": answer,
-            "relevant_concepts": relevant_concepts,
-            "relevant_chunks": [
-                {
-                    "content": chunk["content"],
-                    "similarity": chunk["similarity"],
-                    "document_id": chunk.get("document_id")
-                }
-                for chunk in relevant_chunks
-            ],
-            "confidence": confidence,
-            "timestamp": datetime.utcnow().isoformat()
-        }
+_BRAIN_SUMMARY_PROMPT = """\
+You are a research synthesis expert. Below is a structured summary of \
+a research knowledge base.
 
-    async def build_consensus(
-        self,
-        concepts: List[Dict[str, Any]],
-        claims: Dict[int, List[Dict[str, Any]]],
-        relationships: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Build consensus view of the knowledge base.
+## Concept Consensus Summary
+- Strong consensus (score > 0.8): {strong}
+- Contested areas (score 0.3–0.8): {contested}
+- Key contradictions (score < 0.3): {contradicted}
 
-        Args:
-            concepts: List of all concepts
-            claims: Mapping of concept_id to claims
-            relationships: List of relationships
+## Statistics
+- Total concepts: {total_concepts}
+- Total relationships: {total_relationships}
+- Total knowledge gaps detected: {total_gaps}
 
-        Returns:
-            Consensus summary and key findings
-        """
-        # Calculate consensus scores for concepts
-        concepts_with_consensus = await self._calculate_consensus_scores(
-            concepts,
-            claims
-        )
+Write a concise 2-3 paragraph synthesis describing:
+1. What this research collection covers and its areas of strong agreement.
+2. What remains contested or under-explored.
+3. The most important knowledge gaps that future research should address.
 
-        # Identify high-consensus concepts
-        high_consensus = [
-            c for c in concepts_with_consensus
-            if c.get("consensus_score", 0) > 0.7
-        ]
+Be direct and specific. Do not invent facts not implied by the data above.
 
-        # Identify areas of disagreement
-        low_consensus = [
-            c for c in concepts_with_consensus
-            if c.get("consensus_score", 0) < 0.5
-        ]
+Synthesis:"""
 
-        # Generate overall summary
-        summary = await self._generate_consensus_summary(
-            high_consensus,
-            low_consensus,
-            relationships
-        )
 
-        return {
-            "summary": summary,
-            "high_consensus_concepts": [
-                {"id": c["id"], "name": c["name"], "score": c.get("consensus_score")}
-                for c in high_consensus[:10]
-            ],
-            "areas_of_disagreement": [
-                {"id": c["id"], "name": c["name"], "score": c.get("consensus_score")}
-                for c in low_consensus[:10]
-            ],
-            "total_concepts": len(concepts),
-            "avg_consensus": sum(
-                c.get("consensus_score", 0.5) for c in concepts_with_consensus
-            ) / len(concepts_with_consensus) if concepts_with_consensus else 0.0,
-            "timestamp": datetime.utcnow().isoformat()
-        }
+_CHAT_PROMPT = """\
+You are a knowledgeable research assistant with access to a curated knowledge base.
 
-    async def _find_relevant_chunks(
-        self,
-        query_embedding: List[float],
-        chunks: List[Dict[str, Any]],
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """Find most relevant chunks for query."""
-        chunk_similarities = []
+## User Question
+{question}
 
-        for chunk in chunks:
-            if chunk.get("embedding"):
-                similarity = await self.embedding_service.compute_similarity(
-                    query_embedding,
-                    chunk["embedding"]
-                )
-                chunk_similarities.append({
-                    **chunk,
-                    "similarity": similarity
-                })
+## Relevant Text Excerpts
+{chunks}
 
-        # Sort by similarity and return top k
-        chunk_similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        return chunk_similarities[:top_k]
+## Relevant Concepts
+{concepts}
 
-    async def _find_relevant_concepts(
-        self,
-        query_embedding: List[float],
-        concepts: List[Dict[str, Any]],
-        top_k: int = 5
-    ) -> List[Dict[str, Any]]:
-        """Find most relevant concepts for query."""
-        concept_similarities = []
+## Supporting Claims
+{claims}
 
-        for concept in concepts:
-            if concept.get("embedding"):
-                similarity = await self.embedding_service.compute_similarity(
-                    query_embedding,
-                    concept["embedding"]
-                )
-                concept_similarities.append({
-                    **concept,
-                    "similarity": similarity
-                })
+## Known Knowledge Gaps
+{gaps}
 
-        # Sort by similarity and return top k
-        concept_similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        return concept_similarities[:top_k]
-
-    async def _build_context(
-        self,
-        chunks: List[Dict[str, Any]],
-        concepts: List[Dict[str, Any]]
-    ) -> str:
-        """Build context string from chunks and concepts."""
-        context_parts = ["# Relevant Information\n"]
-
-        # Add concept information
-        if concepts:
-            context_parts.append("\n## Key Concepts:")
-            for concept in concepts:
-                context_parts.append(
-                    f"\n- {concept['name']}: {concept.get('description', 'No description')}"
-                )
-
-        # Add chunk content
-        if chunks:
-            context_parts.append("\n\n## Relevant Text Excerpts:")
-            for i, chunk in enumerate(chunks, 1):
-                context_parts.append(f"\n{i}. {chunk['content'][:500]}")
-
-        return "\n".join(context_parts)
-
-    async def _generate_answer(
-        self,
-        query: str,
-        context: str,
-        include_gaps: bool = True
-    ) -> str:
-        """Generate answer using LLM with context."""
-        prompt = f"""Based on the following context, answer this question: {query}
-
-{context}
-
-Provide a comprehensive answer based on the information above. If the information is insufficient, acknowledge what is known and what gaps exist.
+Answer the user's question based strictly on the provided context. \
+If the context is insufficient, say so and point to what additional \
+research might be needed. Cite sources by filename where possible.
 
 Answer:"""
 
-        answer = await self.llm_extractor._call_llm(prompt, max_tokens=500)
-        return answer.strip() if answer else "Unable to generate answer at this time."
 
-    async def _calculate_confidence(
+# ---------------------------------------------------------------------------
+# BrainService
+# ---------------------------------------------------------------------------
+
+class BrainService:
+    """Consensus scoring, brain state persistence, and RAG chat."""
+
+    # Claim-type weights used in the consensus scoring formula
+    _SUPPORT_WEIGHTS: Dict[ClaimType, float] = {
+        ClaimType.SUPPORTS: 1.0,
+        ClaimType.EXTENDS: 0.7,
+        ClaimType.COMPLEMENTS: 0.5,
+    }
+    _CONTRADICT_WEIGHTS: Dict[ClaimType, float] = {
+        ClaimType.CONTRADICTS: 1.0,
+    }
+
+    def __init__(self) -> None:
+        self._embedder = OllamaEmbeddingService()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def build_brain(
         self,
-        chunks: List[Dict[str, Any]],
-        concepts: List[Dict[str, Any]]
-    ) -> float:
-        """Calculate confidence score for query response."""
-        if not chunks and not concepts:
-            return 0.0
+        project_id: int,
+        db: AsyncSession,
+        *,
+        clear_existing: bool = False,
+    ) -> BrainBuildResult:
+        """
+        Full brain-building pipeline:
 
-        # Average similarity scores
-        chunk_scores = [c.get("similarity", 0) for c in chunks]
-        concept_scores = [c.get("similarity", 0) for c in concepts]
+        1. Optionally clear an existing BrainState row.
+        2. Compute & persist consensus_score for every concept.
+        3. Gather project statistics.
+        4. Generate an LLM synthesis summary.
+        5. Upsert the BrainState row.
+        6. Commit all changes.
+        """
+        if clear_existing:
+            await self._clear_brain_state(project_id, db)
 
-        all_scores = chunk_scores + concept_scores
-        avg_similarity = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        # Step 2 — consensus scoring (writes concept.consensus_score)
+        summary = await self._score_all_concepts(project_id, db)
 
-        # Adjust confidence based on number of sources
-        source_factor = min(len(chunks) + len(concepts), 10) / 10
+        # Step 3 — project statistics
+        total_concepts = await self._count_concepts(project_id, db)
+        rel_count = await self._count_relationships(project_id, db)
+        gap_count = await self._count_gaps(project_id, db)
 
-        confidence = avg_similarity * 0.7 + source_factor * 0.3
+        # Step 4 — LLM summary
+        summary_text = await self._generate_summary(
+            summary, total_concepts, rel_count, gap_count
+        )
 
-        return min(confidence, 1.0)
+        # Step 5 — persist BrainState
+        await self._persist_brain_state(project_id, db, summary_text, summary)
 
-    async def _calculate_consensus_scores(
+        # Step 6 — single commit for both concept scores + brain state
+        await db.commit()
+
+        return BrainBuildResult(
+            project_id=project_id,
+            concepts_scored=total_concepts,
+            strong_consensus_count=len(summary.strong),
+            contested_count=len(summary.contested),
+            contradiction_count=len(summary.contradicted),
+            summary_text=summary_text,
+            message=(
+                f"Brain built: {total_concepts} concepts scored, "
+                f"{len(summary.strong)} strong consensus, "
+                f"{len(summary.contested)} contested, "
+                f"{len(summary.contradicted)} contradictions."
+            ),
+        )
+
+    async def chat(
         self,
-        concepts: List[Dict[str, Any]],
-        claims: Dict[int, List[Dict[str, Any]]]
-    ) -> List[Dict[str, Any]]:
-        """Calculate consensus scores for concepts based on claims."""
-        concepts_with_scores = []
+        question: str,
+        project_id: int,
+        db: AsyncSession,
+        top_k: int = 5,
+    ) -> ChatResult:
+        """
+        RAG pipeline:
+
+        1. Embed the question.
+        2. pgvector chunk similarity search (filtered to this project).
+        3. pgvector concept similarity search.
+        4. Gather claims + gap nodes for the matched concepts.
+        5. Format context → LLM prompt → answer.
+        """
+        # 1 — embed
+        q_emb = await self._embedder.embed_text(question)
+        if q_emb is None:
+            return ChatResult(
+                question=question,
+                answer="Unable to embed the question (Ollama may be unavailable).",
+                sources=[],
+                relevant_concepts=[],
+                confidence=0.0,
+            )
+
+        # 2 — chunk search (fetch extra, then filter by project)
+        project_doc_ids = await self._get_project_doc_ids(project_id, db)
+        all_chunks = await self._embedder.find_similar_chunks(
+            q_emb, db, top_k=top_k * 3, threshold=0.35
+        )
+        similar_chunks = [
+            c for c in all_chunks if c["document_id"] in project_doc_ids
+        ][:top_k]
+
+        # 3 — relevant concepts via pgvector
+        relevant_concepts = await self._find_relevant_concepts(
+            q_emb, project_id, db, top_k=top_k
+        )
+
+        # 4 — claims + gaps
+        concept_ids = [c["id"] for c in relevant_concepts]
+        claims = await self._load_claims_for(concept_ids, db)
+        gaps = await self._load_gaps_for(project_id, db)
+
+        # 5 — build prompt + LLM call
+        prompt = _CHAT_PROMPT.format(
+            question=question,
+            chunks=self._format_chunks(similar_chunks) or "(none)",
+            concepts=self._format_concepts(relevant_concepts) or "(none)",
+            claims=self._format_claims(claims) or "(none)",
+            gaps=self._format_gaps(gaps),
+        )
+        answer = await self._call_llm(prompt, max_tokens=600)
+
+        confidence = (
+            sum(c["similarity"] for c in similar_chunks) / len(similar_chunks)
+            if similar_chunks
+            else 0.3
+        )
+        sources = list({c["filename"] for c in similar_chunks})
+        concept_names = [c["name"] for c in relevant_concepts]
+
+        return ChatResult(
+            question=question,
+            answer=answer or "No answer generated.",
+            sources=sources,
+            relevant_concepts=concept_names,
+            confidence=min(confidence, 1.0),
+        )
+
+    # ------------------------------------------------------------------
+    # Consensus scoring
+    # ------------------------------------------------------------------
+
+    async def _score_all_concepts(
+        self, project_id: int, db: AsyncSession
+    ) -> ConsensusSummary:
+        """Compute and persist consensus_score for every concept in the project."""
+        concept_result = await db.execute(
+            select(Concept).where(Concept.project_id == project_id)
+        )
+        concepts = concept_result.scalars().all()
+
+        if not concepts:
+            return ConsensusSummary(
+                strong=[], contested=[], contradicted=[], avg_score=0.5
+            )
+
+        # Load all claims for this project's concepts in one query
+        concept_ids = [c.id for c in concepts]
+        claim_result = await db.execute(
+            select(Claim).where(Claim.concept_id.in_(concept_ids))
+        )
+        all_claims = claim_result.scalars().all()
+
+        # Group by concept_id
+        claims_by_concept: Dict[int, List[Claim]] = {}
+        for claim in all_claims:
+            claims_by_concept.setdefault(claim.concept_id, []).append(claim)
+
+        strong: List[str] = []
+        contested: List[str] = []
+        contradicted: List[str] = []
+        total_score = 0.0
 
         for concept in concepts:
-            concept_id = concept["id"]
-            concept_claims = claims.get(concept_id, [])
-
-            if not concept_claims:
-                # No claims = neutral consensus
-                consensus_score = 0.5
+            score = self._compute_consensus(claims_by_concept.get(concept.id, []))
+            concept.consensus_score = score
+            total_score += score
+            if score > 0.8:
+                strong.append(concept.name)
+            elif score < 0.3:
+                contradicted.append(concept.name)
             else:
-                # Calculate based on claim types
-                supports = sum(1 for c in concept_claims if c.get("claim_type") == "supports")
-                contradicts = sum(1 for c in concept_claims if c.get("claim_type") == "contradicts")
-                total = len(concept_claims)
+                contested.append(concept.name)
 
-                # Higher support ratio = higher consensus
-                consensus_score = (supports - contradicts * 0.5) / total if total > 0 else 0.5
-                consensus_score = max(0.0, min(1.0, consensus_score))
+        avg_score = total_score / len(concepts)
+        return ConsensusSummary(
+            strong=strong,
+            contested=contested,
+            contradicted=contradicted,
+            avg_score=avg_score,
+        )
 
-            concepts_with_scores.append({
-                **concept,
-                "consensus_score": consensus_score
-            })
+    def _compute_consensus(self, claims: List[Claim]) -> float:
+        """
+        consensus_score = support_weight / (support_weight + contradict_weight)
 
-        return concepts_with_scores
+        Weights:
+          supports    → 1.0   (strong positive evidence)
+          extends     → 0.7   (builds on, partial support)
+          complements → 0.5   (neutral-positive)
+          contradicts → 1.0   (strong negative evidence)
 
-    async def _generate_consensus_summary(
+        Falls back to 0.5 (neutral) when there are no claims.
+        """
+        if not claims:
+            return 0.5
+
+        support = sum(self._SUPPORT_WEIGHTS.get(c.claim_type, 0.0) for c in claims)
+        contra = sum(self._CONTRADICT_WEIGHTS.get(c.claim_type, 0.0) for c in claims)
+        total = support + contra
+        return support / total if total > 0 else 0.5
+
+    # ------------------------------------------------------------------
+    # LLM helpers
+    # ------------------------------------------------------------------
+
+    async def _generate_summary(
         self,
-        high_consensus: List[Dict[str, Any]],
-        low_consensus: List[Dict[str, Any]],
-        relationships: List[Dict[str, Any]]
+        summary: ConsensusSummary,
+        total_concepts: int,
+        total_relationships: int,
+        total_gaps: int,
     ) -> str:
-        """Generate summary of consensus findings."""
-        summary_parts = []
+        prompt = _BRAIN_SUMMARY_PROMPT.format(
+            strong=", ".join(summary.strong[:10]) or "none",
+            contested=", ".join(summary.contested[:10]) or "none",
+            contradicted=", ".join(summary.contradicted[:10]) or "none",
+            total_concepts=total_concepts,
+            total_relationships=total_relationships,
+            total_gaps=total_gaps,
+        )
+        raw = await self._call_llm(prompt, max_tokens=500)
+        return raw.strip() if raw else "Insufficient data to generate synthesis."
 
-        # High consensus areas
-        if high_consensus:
-            concept_names = [c["name"] for c in high_consensus[:5]]
-            summary_parts.append(
-                f"Strong consensus exists on: {', '.join(concept_names)}"
+    async def _call_llm(self, prompt: str, max_tokens: int = 500) -> str:
+        """POST to Ollama /api/generate and return the response text."""
+        payload = {
+            "model": settings.OLLAMA_LLM_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": max_tokens, "temperature": 0.3},
+        }
+        timeout = httpx.Timeout(settings.OLLAMA_TIMEOUT, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_BASE_URL}/api/generate",
+                    json=payload,
+                )
+            if resp.status_code != 200:
+                logger.error("LLM /api/generate returned %d: %s", resp.status_code, resp.text[:200])
+                return ""
+            return resp.json().get("response", "")
+        except Exception as exc:
+            logger.error("_call_llm error: %s", exc)
+            return ""
+
+    # ------------------------------------------------------------------
+    # DB helpers
+    # ------------------------------------------------------------------
+
+    async def _persist_brain_state(
+        self,
+        project_id: int,
+        db: AsyncSession,
+        summary_text: str,
+        summary: ConsensusSummary,
+    ) -> None:
+        result = await db.execute(
+            select(BrainState)
+            .where(BrainState.project_id == project_id)
+            .order_by(BrainState.last_updated.desc())
+            .limit(1)
+        )
+        brain_state = result.scalar_one_or_none()
+
+        consensus_json = {
+            "strong_consensus": summary.strong[:20],
+            "contested": summary.contested[:20],
+            "contradictions": summary.contradicted[:20],
+            "avg_score": round(summary.avg_score, 4),
+        }
+
+        if brain_state:
+            brain_state.summary_text = summary_text
+            brain_state.consensus_json = consensus_json
+        else:
+            brain_state = BrainState(
+                project_id=project_id,
+                summary_text=summary_text,
+                consensus_json=consensus_json,
             )
+            db.add(brain_state)
 
-        # Areas of disagreement
-        if low_consensus:
-            concept_names = [c["name"] for c in low_consensus[:3]]
-            summary_parts.append(
-                f"Areas requiring further investigation: {', '.join(concept_names)}"
-            )
+    async def _clear_brain_state(self, project_id: int, db: AsyncSession) -> None:
+        result = await db.execute(
+            select(BrainState).where(BrainState.project_id == project_id)
+        )
+        for state in result.scalars().all():
+            await db.delete(state)
+        await db.flush()
 
-        # Relationship insights
-        if relationships:
-            summary_parts.append(
-                f"Knowledge base contains {len(relationships)} documented relationships between concepts"
-            )
+    async def _count_concepts(self, project_id: int, db: AsyncSession) -> int:
+        result = await db.execute(
+            select(func.count())
+            .select_from(Concept)
+            .where(Concept.project_id == project_id)
+        )
+        return result.scalar() or 0
 
-        return ". ".join(summary_parts) if summary_parts else "Insufficient data for consensus analysis."
+    async def _count_gaps(self, project_id: int, db: AsyncSession) -> int:
+        result = await db.execute(
+            select(func.count())
+            .select_from(Concept)
+            .where(Concept.project_id == project_id, Concept.is_gap == True)
+        )
+        return result.scalar() or 0
+
+    async def _count_relationships(self, project_id: int, db: AsyncSession) -> int:
+        """Count relationships whose source concept belongs to the project."""
+        result = await db.execute(
+            select(func.count())
+            .select_from(Relationship)
+            .join(Concept, Relationship.source_concept_id == Concept.id)
+            .where(Concept.project_id == project_id)
+        )
+        return result.scalar() or 0
+
+    async def _get_project_doc_ids(
+        self, project_id: int, db: AsyncSession
+    ) -> Set[int]:
+        result = await db.execute(
+            select(Document.id).where(Document.project_id == project_id)
+        )
+        return {row[0] for row in result.all()}
+
+    async def _find_relevant_concepts(
+        self,
+        q_emb: List[float],
+        project_id: int,
+        db: AsyncSession,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """pgvector cosine similarity search over non-gap project concepts."""
+        embedding_str = "[" + ",".join(f"{v:.8f}" for v in q_emb) + "]"
+        sql = text(
+            """
+            SELECT
+                c.id,
+                c.name,
+                c.description,
+                c.coverage_score,
+                c.consensus_score,
+                1 - (c.embedding <=> CAST(:embedding AS vector)) AS similarity
+            FROM concepts c
+            WHERE c.project_id = :project_id
+              AND c.embedding IS NOT NULL
+              AND c.is_gap = false
+            ORDER BY c.embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+            """
+        )
+        result = await db.execute(
+            sql,
+            {"embedding": embedding_str, "project_id": project_id, "top_k": top_k},
+        )
+        rows = result.mappings().all()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "description": row["description"],
+                "coverage_score": row["coverage_score"],
+                "consensus_score": row["consensus_score"],
+                "similarity": float(row["similarity"]),
+            }
+            for row in rows
+        ]
+
+    async def _load_claims_for(
+        self, concept_ids: List[int], db: AsyncSession
+    ) -> List[Dict[str, Any]]:
+        if not concept_ids:
+            return []
+        result = await db.execute(
+            select(Claim).where(Claim.concept_id.in_(concept_ids))
+        )
+        claims = result.scalars().all()
+        return [
+            {
+                "claim_text": c.claim_text,
+                "claim_type": c.claim_type.value,
+                "confidence": c.confidence,
+                "concept_id": c.concept_id,
+            }
+            for c in claims
+        ]
+
+    async def _load_gaps_for(
+        self, project_id: int, db: AsyncSession
+    ) -> List[Dict[str, Any]]:
+        result = await db.execute(
+            select(Concept)
+            .where(Concept.project_id == project_id, Concept.is_gap == True)
+            .limit(5)
+        )
+        gaps = result.scalars().all()
+        return [
+            {
+                "name": g.name,
+                "description": g.description,
+                "gap_type": g.gap_type.value if g.gap_type else None,
+            }
+            for g in gaps
+        ]
+
+    # ------------------------------------------------------------------
+    # Prompt context formatters
+    # ------------------------------------------------------------------
+
+    def _format_chunks(self, chunks: List[Dict[str, Any]]) -> str:
+        parts = []
+        for i, c in enumerate(chunks, 1):
+            snippet = c["content"][:400].replace("\n", " ")
+            parts.append(f"[{i}] ({c['filename']}) {snippet}")
+        return "\n".join(parts)
+
+    def _format_concepts(self, concepts: List[Dict[str, Any]]) -> str:
+        parts = []
+        for c in concepts:
+            desc = (c.get("description") or "")[:150]
+            score = c.get("consensus_score")
+            score_tag = f" [consensus: {score:.2f}]" if score is not None else ""
+            parts.append(f"- {c['name']}{score_tag}: {desc}")
+        return "\n".join(parts)
+
+    def _format_claims(self, claims: List[Dict[str, Any]]) -> str:
+        parts = []
+        for c in claims[:12]:
+            parts.append(f"- [{c['claim_type']}] {c['claim_text'][:200]}")
+        return "\n".join(parts)
+
+    def _format_gaps(self, gaps: List[Dict[str, Any]]) -> str:
+        if not gaps:
+            return "(no gaps detected)"
+        parts = []
+        for g in gaps:
+            desc = (g.get("description") or "")[:120]
+            parts.append(f"- {g['name']} ({g['gap_type']}): {desc}")
+        return "\n".join(parts)
