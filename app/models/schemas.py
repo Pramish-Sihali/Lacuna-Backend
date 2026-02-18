@@ -231,3 +231,89 @@ class ProjectStatistics(BaseModel):
     total_relationships: int
     coverage_distribution: Dict[str, int]  # low, medium, high
     gap_type_distribution: Dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+# Embedding / Search Schemas
+# ---------------------------------------------------------------------------
+
+class EmbedDocumentResponse(BaseModel):
+    """Response for POST /api/documents/{document_id}/embed."""
+
+    document_id: int
+    embedded_chunks: int
+    total_chunks: int
+    status: str          # "completed" | "partial" | "no_chunks"
+    message: str
+
+
+class EmbedAllResponse(BaseModel):
+    """Response for POST /api/documents/embed-all."""
+
+    documents_processed: int
+    total_embedded: int
+    total_chunks: int
+    message: str
+
+
+class SimilarChunkResult(BaseModel):
+    """A single result from a similarity search."""
+
+    chunk_id: int
+    document_id: int
+    chunk_index: int
+    content: str
+    similarity: float
+    filename: str
+    file_type: str
+    metadata_json: Optional[Dict[str, Any]] = None
+
+
+class SimilarChunksResponse(BaseModel):
+    """Response for GET /api/search/similar."""
+
+    query: str
+    results: List[SimilarChunkResult]
+    total_results: int
+
+
+# ---------------------------------------------------------------------------
+# Extraction Schemas
+# ---------------------------------------------------------------------------
+
+class ExtractionResponse(BaseModel):
+    """Response for POST /api/documents/{document_id}/extract."""
+
+    document_id: int
+    document_title: str
+    chunks_processed: int
+    chunks_skipped: int
+    concepts_extracted: int   # raw count before deduplication
+    concepts_saved: int       # net new concepts added to the project
+    claims_saved: int
+    relationships_found: int
+    errors: List[str]
+    message: str
+
+
+class ProcessDocumentResponse(BaseModel):
+    """
+    Response for POST /api/documents/{document_id}/process.
+
+    Combines results from the embedding phase and the extraction phase.
+    """
+
+    document_id: int
+    document_title: str
+    # --- embedding phase ---
+    embedded_chunks: int
+    total_chunks: int
+    # --- extraction phase ---
+    chunks_processed: int
+    chunks_skipped: int
+    concepts_extracted: int
+    concepts_saved: int
+    claims_saved: int
+    relationships_found: int
+    errors: List[str]
+    message: str

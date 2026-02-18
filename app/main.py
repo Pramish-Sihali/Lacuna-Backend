@@ -12,7 +12,7 @@ from datetime import datetime
 
 from app.config import settings
 from app.database import init_db, close_db
-from app.routers import health, documents, concepts, brain
+from app.routers import health, documents, concepts, brain, search
 
 # Configure logging
 logging.basicConfig(
@@ -106,6 +106,7 @@ app.include_router(health.router, prefix="/api/health", tags=["Health"])
 app.include_router(documents.router, prefix="/api/documents", tags=["Documents"])
 app.include_router(concepts.router, prefix="/api/concepts", tags=["Concepts"])
 app.include_router(brain.router, prefix="/api/brain", tags=["Brain"])
+app.include_router(search.router, prefix="/api/search", tags=["Search"])
 
 
 # Root endpoint
