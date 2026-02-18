@@ -288,6 +288,32 @@ health_score = 0.40 * avg_consensus + 0.30 * min(doc_count / 10, 1.0) + 0.30 * m
 - `position` is always `{x:0, y:0}` — the frontend handles layout
 - `gap_type` and `gap_subtype` match the values stored by `GapDetector`
 
+## Frontend Integration Status (as of 2026-02-18)
+
+The Next.js frontend (`../lacuna/`) is now wired to this backend. All communication goes through `lib/api/` in the frontend.
+
+### Connected endpoints
+| Frontend action | Backend endpoint |
+|---|---|
+| Concept map renders | `GET /api/concepts/map` |
+| Chat panel sends message | `POST /api/brain/chat` |
+| Upload tab (PDF/DOCX) | `POST /api/documents/upload` → `POST /api/documents/{id}/process` |
+| Health / status | `GET /api/health` |
+
+### Typical first-use workflow
+1. Start the backend: `uvicorn app.main:app --reload --port 8000`
+2. Open the frontend at `http://localhost:3000`
+3. Open a room → click **Add Papers** → **Upload File** tab → upload PDFs/DOCX
+4. Trigger knowledge build: `POST /api/pipeline/process-all` via Swagger at `http://localhost:8000/docs`
+5. Refresh the room — the concept map now shows real nodes from the backend
+6. Chat with the AI in the Chat tab
+
+### Data flow notes
+- All positions in `/api/concepts/map` are `{x:0, y:0}` — correct, the frontend's `useForceLayout` (Cytoscape fcose) handles the actual positioning
+- Backend relationship types (`builds_on`, `prerequisite`, `similar`, `parent_child`) are mapped to frontend types (`extends`, `supports`, `complements`) in `lib/api/transform.ts`
+- CORS is configured for `http://localhost:3000` and `http://localhost:3001` via `ALLOWED_ORIGINS` in `.env`
+- The frontend gracefully falls back to demo scenario data when the backend is unreachable
+
 ## Current Limitations
 - Single-user (hardcoded `DEFAULT_PROJECT_ID=1`, no auth)
 - Background tasks (legacy `/extract`) have no progress tracking
