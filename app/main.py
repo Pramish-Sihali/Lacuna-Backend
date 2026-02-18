@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import close_db, init_db
-from app.routers import brain, concepts, documents, health, search
+from app.routers import brain, concepts, documents, health, rooms, search
 from app.routers import pipeline
 
 # ---------------------------------------------------------------------------
@@ -235,6 +235,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ---------------------------------------------------------------------------
 
 app.include_router(health.router,     prefix="/api/health",    tags=["Health"])
+app.include_router(rooms.router,     prefix="/api/rooms",     tags=["Rooms"])
 app.include_router(documents.router,  prefix="/api/documents", tags=["Documents"])
 app.include_router(concepts.router,   prefix="/api/concepts",  tags=["Concepts"])
 app.include_router(brain.router,      prefix="/api/brain",     tags=["Brain"])

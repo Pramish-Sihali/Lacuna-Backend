@@ -57,6 +57,29 @@ class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# Room Schemas (Room = Project with user ownership)
+class RoomCreateRequest(BaseModel):
+    """Schema for creating a new room (project)."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    color_index: int = Field(0, ge=0, le=4)
+
+
+class RoomResponse(BaseModel):
+    """Schema for room responses."""
+
+    id: int
+    name: str
+    description: Optional[str] = None
+    color_index: int = 0
+    paper_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # Document Schemas
 class DocumentUploadResponse(BaseModel):
     """Schema for document upload response."""

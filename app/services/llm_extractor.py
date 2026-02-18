@@ -482,7 +482,7 @@ class OllamaLLMService:
         # --- load existing project concepts for deduplication ---
         existing_result = await db.execute(
             select(Concept).where(
-                Concept.project_id == settings.DEFAULT_PROJECT_ID
+                Concept.project_id == document.project_id
             )
         )
         existing_concepts = existing_result.scalars().all()
@@ -603,7 +603,7 @@ class OllamaLLMService:
 
             # Genuinely new — persist to DB
             new_concept = Concept(
-                project_id=settings.DEFAULT_PROJECT_ID,
+                project_id=document.project_id,
                 name=concept_name,
                 description=concept_dict.get("description", ""),
                 generality_score=concept_dict.get("generality_score", 0.5),

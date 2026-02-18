@@ -55,8 +55,22 @@ class GapType(str, enum.Enum):
 
 
 # Models
+class User(Base):
+    """User account (synced from NextAuth)."""
+
+    __tablename__ = "users"
+
+    id = Column(String(255), primary_key=True)  # matches NextAuth UUID
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    name = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Relationships
+    projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
+
+
 class Project(Base):
-    """Research project containing documents and concepts."""
+    """Research project containing documents and concepts (= a Room in the frontend)."""
 
     __tablename__ = "projects"
 
@@ -68,7 +82,13 @@ class Project(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    # Owner (nullable for demo / legacy data)
+    user_id = Column(String(255), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Room color index (0-4 mapping to ROOM_COLORS in frontend)
+    color_index = Column(Integer, default=0)
+
     # Relationships
+    user = relationship("User", back_populates="projects")
     documents = relationship("Document", back_populates="project", cascade="all, delete-orphan")
     concepts = relationship("Concept", back_populates="project", cascade="all, delete-orphan")
     brain_states = relationship("BrainState", back_populates="project", cascade="all, delete-orphan")
