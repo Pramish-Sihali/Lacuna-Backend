@@ -8,7 +8,17 @@
       "Bash(venv/Scripts/pip install:*)",
       "Bash(python -m py_compile:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/ -v)",
+      "Bash(./venv/Scripts/pip.exe install:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(venvScriptsactivate)",
+      "Bash(alembic current:*)",
+      "Bash(source:*)",
+      "Bash(alembic history:*)",
+      "Bash(alembic stamp:*)",
+      "Bash(alembic upgrade:*)"
     ]
   }
 }

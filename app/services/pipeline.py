@@ -22,11 +22,11 @@ import logging
 import time
 from typing import Any, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
-from app.models.database_models import Document
+from app.models.database_models import Chunk, Document
 from app.services.brain_service import BrainService
 from app.services.clustering import ConceptClusterer
 from app.services.embedding import OllamaEmbeddingService
@@ -422,6 +422,26 @@ class LacunaPipeline:
         )
 
     # ------------------------------------------------------------------
+    # Preflight check
+    # ------------------------------------------------------------------
+
+    async def _preflight_check(self) -> None:
+        """
+        Verify Ollama is reachable before starting the pipeline.
+
+        Raises ``RuntimeError`` if Ollama is down — callers should catch
+        this and fail fast with a clear error message.
+        """
+        healthy = await self._embedder.check_ollama_health()
+        if not healthy:
+            raise RuntimeError(
+                "Ollama is not reachable at "
+                f"{self._embedder.base_url}. "
+                "Start Ollama before running the pipeline."
+            )
+        logger.info("Preflight check passed: Ollama is reachable")
+
+    # ------------------------------------------------------------------
     # Phased batch pipeline (background task)
     # ------------------------------------------------------------------
 
@@ -447,6 +467,15 @@ class LacunaPipeline:
         """
         from app.services.pipeline_manager import PipelinePhase
 
+        # Preflight: verify Ollama is reachable before doing any work
+        try:
+            await self._preflight_check()
+        except RuntimeError as exc:
+            logger.error("process_all_phased: preflight failed — %s", exc)
+            status.phase = PipelinePhase.FAILED
+            status.errors.append(str(exc))
+            return
+
         # Load documents to process
         async with AsyncSessionLocal() as db:
             stmt = select(Document).where(Document.project_id == project_id)
@@ -468,12 +497,28 @@ class LacunaPipeline:
                 return
 
         # ── Phase 1: Embed documents ──────────────────────────────────
-        # embed_document_chunks already skips chunks with existing embeddings
+        # embed_document_chunks already skips chunks with existing embeddings,
+        # but we skip the whole doc if all chunks are already embedded.
         if documents:
             status.phase = PipelinePhase.EMBEDDING
             for doc in documents:
                 async with AsyncSessionLocal() as session:
                     try:
+                        # Resume: check if doc already fully embedded
+                        unembedded = await session.execute(
+                            select(func.count(Chunk.id)).where(
+                                Chunk.document_id == doc.id,
+                                Chunk.embedding.is_(None),
+                            )
+                        )
+                        if unembedded.scalar() == 0:
+                            logger.info(
+                                "process_all_phased: doc %d already fully embedded — skipping",
+                                doc.id,
+                            )
+                            status.documents_embedded += 1
+                            continue
+
                         status.current_document = doc.filename
                         await self._embedder.embed_document_chunks(doc.id, session)
                         status.documents_embedded += 1
@@ -483,11 +528,28 @@ class LacunaPipeline:
                         logger.error("process_all_phased: embed failed doc %d: %s", doc.id, exc)
 
         # ── Phase 2: Extract documents (LLM) ─────────────────────────
+        # process_document() already skips extracted/skipped chunks internally,
+        # but we skip the whole doc if all chunks are already done.
         if documents:
             status.phase = PipelinePhase.EXTRACTING
             for doc in documents:
                 async with AsyncSessionLocal() as session:
                     try:
+                        # Resume: check if doc has any unprocessed chunks
+                        unextracted = await session.execute(
+                            select(func.count(Chunk.id)).where(
+                                Chunk.document_id == doc.id,
+                                Chunk.extraction_status.is_(None),
+                            )
+                        )
+                        if unextracted.scalar() == 0:
+                            logger.info(
+                                "process_all_phased: doc %d already fully extracted — skipping",
+                                doc.id,
+                            )
+                            status.documents_extracted += 1
+                            continue
+
                         status.current_document = doc.filename
                         await self._llm.process_document(doc.id, session)
                         status.documents_extracted += 1

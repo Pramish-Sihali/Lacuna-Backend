@@ -133,6 +133,42 @@ Return ONLY a JSON array — nothing else:
 [{{"claim_text": "A specific assertion.", "related_concept": "Concept Name", "claim_type": "supports", "confidence": 0.8}}]\
 """
 
+_COMBINED_PROMPT = """\
+You are a research analyst extracting key concepts AND specific claims from academic text.
+
+Given the following text from a document titled "{document_title}":
+
+---
+{chunk_text}
+---
+
+Extract:
+1. **Concepts** (3-8): Key ideas discussed in this text. For each provide:
+   - concept_name: A clear, concise name (2-5 words)
+   - description: What this concept means in context (1-2 sentences)
+   - specificity_level: "broad", "medium", or "specific"
+   - confidence: How confident this is a real, distinct concept (0.0-1.0)
+
+2. **Claims** (2-6): Specific assertions made about the concepts. For each provide:
+   - claim_text: The specific claim in one clear sentence
+   - related_concept: Which concept name from above this claim relates to (exact match)
+   - claim_type: "supports", "contradicts", "extends", or "complements"
+   - confidence: How explicitly stated (0.0 = implied, 1.0 = explicit)
+
+Respond ONLY with valid JSON. No explanation, no markdown:
+{{"concepts": [{{"concept_name": "...", "description": "...", "specificity_level": "medium", "confidence": 0.9}}], "claims": [{{"claim_text": "...", "related_concept": "...", "claim_type": "supports", "confidence": 0.8}}]}}\
+"""
+
+_COMBINED_RETRY_PROMPT = """\
+Extract concepts and claims from this academic text as JSON.
+
+Text:
+{chunk_text}
+
+Return ONLY a JSON object — nothing else, no markdown:
+{{"concepts": [{{"concept_name": "Example", "description": "One sentence.", "specificity_level": "medium", "confidence": 0.8}}], "claims": [{{"claim_text": "A specific assertion.", "related_concept": "Example", "claim_type": "supports", "confidence": 0.8}}]}}\
+"""
+
 _RELATIONSHIP_PROMPT = """\
 You are a research analyst identifying how text relates to other work.
 
@@ -217,6 +253,8 @@ class OllamaLLMService:
     CONCEPT_RETRY_PROMPT = _CONCEPT_RETRY_PROMPT
     CLAIM_PROMPT = _CLAIM_PROMPT
     CLAIM_RETRY_PROMPT = _CLAIM_RETRY_PROMPT
+    COMBINED_PROMPT = _COMBINED_PROMPT
+    COMBINED_RETRY_PROMPT = _COMBINED_RETRY_PROMPT
     RELATIONSHIP_PROMPT = _RELATIONSHIP_PROMPT
     RELATIONSHIP_RETRY_PROMPT = _RELATIONSHIP_RETRY_PROMPT
 
@@ -362,6 +400,100 @@ class OllamaLLMService:
         logger.info("extract_claims: %d claims from chunk", len(claims))
         return claims
 
+    async def extract_concepts_and_claims(
+        self,
+        chunk_text: str,
+        document_context: str = "",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Extract concepts AND claims from a chunk in a single LLM call.
+
+        Returns ``(concepts_list, claims_list)`` — same format as the
+        individual ``extract_concepts`` / ``extract_claims`` methods.
+        Halves LLM usage compared to calling them separately.
+        """
+        if self._is_too_short(chunk_text):
+            return [], []
+
+        document_title = document_context.strip() or "Unknown Document"
+        truncated = chunk_text[:3000]
+
+        prompt = self.COMBINED_PROMPT.format(
+            document_title=document_title,
+            chunk_text=truncated,
+        )
+        retry_prompt = self.COMBINED_RETRY_PROMPT.format(chunk_text=truncated)
+
+        success, raw = await self._call_llm_json(prompt, retry_prompt=retry_prompt)
+        if not success or not isinstance(raw, dict):
+            return [], []
+
+        # --- parse concepts ---
+        raw_concepts = raw.get("concepts", [])
+        if not isinstance(raw_concepts, list):
+            raw_concepts = [raw_concepts] if isinstance(raw_concepts, dict) else []
+
+        seen: set = set()
+        concepts: List[Dict[str, Any]] = []
+
+        for item in raw_concepts:
+            if not isinstance(item, dict):
+                continue
+
+            name = str(item.get("concept_name", "")).strip()
+            if not name:
+                continue
+
+            norm = clean_concept_name(name)
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            specificity = str(item.get("specificity_level", "medium")).lower()
+            if specificity not in self.VALID_SPECIFICITY:
+                specificity = "medium"
+
+            concepts.append({
+                "name": name,
+                "concept_name": name,
+                "description": str(item.get("description", "")).strip(),
+                "specificity_level": specificity,
+                "generality_score": self.SPECIFICITY_TO_GENERALITY[specificity],
+                "confidence": self._clamp(item.get("confidence", 0.7)),
+            })
+
+        # --- parse claims ---
+        raw_claims = raw.get("claims", [])
+        if not isinstance(raw_claims, list):
+            raw_claims = [raw_claims] if isinstance(raw_claims, dict) else []
+
+        claims: List[Dict[str, Any]] = []
+        for item in raw_claims:
+            if not isinstance(item, dict):
+                continue
+
+            claim_text = str(item.get("claim_text", "")).strip()
+            if not claim_text:
+                continue
+
+            claim_type = str(item.get("claim_type", "supports")).lower().strip()
+            if claim_type not in self.VALID_CLAIM_TYPES:
+                claim_type = "supports"
+
+            claims.append({
+                "claim_text": claim_text,
+                "related_concept": str(item.get("related_concept", "")).strip(),
+                "claim_type": claim_type,
+                "confidence": self._clamp(item.get("confidence", 0.7)),
+            })
+
+        logger.info(
+            "extract_concepts_and_claims: %d concepts, %d claims from chunk",
+            len(concepts),
+            len(claims),
+        )
+        return concepts, claims
+
     async def extract_relationships(
         self,
         chunk_text: str,
@@ -495,16 +627,29 @@ class OllamaLLMService:
 
         embedding_svc = OllamaEmbeddingService()
 
-        # --- per-chunk extraction ---
-        chunks_processed = 0
+        # --- per-chunk extraction (with resume support) ---
+        # Filter out chunks that were already extracted in a previous run
+        chunks_to_process = [
+            c for c in chunks
+            if c.extraction_status not in ("extracted", "skipped")
+        ]
+        already_extracted = len(chunks) - len(chunks_to_process)
+        if already_extracted > 0:
+            logger.info(
+                "process_document %d: resuming — %d/%d chunks already done, %d remaining",
+                document_id, already_extracted, len(chunks), len(chunks_to_process),
+            )
+
+        chunks_processed = already_extracted
         chunks_skipped = 0
         all_raw_concepts: List[Tuple[Dict, int]] = []   # (concept_dict, chunk_id)
         all_raw_claims: List[Tuple[Dict, int]] = []     # (claim_dict, chunk_id)
         errors: List[str] = []
 
-        for chunk in chunks:
+        for chunk in chunks_to_process:
             if self._is_too_short(chunk.content):
                 chunks_skipped += 1
+                chunk.extraction_status = "skipped"
                 logger.debug(
                     "Skipping short chunk id=%d (~%d words)",
                     chunk.id,
@@ -513,26 +658,17 @@ class OllamaLLMService:
                 continue
 
             try:
-                concepts = await self.extract_concepts(
+                # Combined prompt: 1 LLM call per chunk instead of 2
+                concepts, claims = await self.extract_concepts_and_claims(
                     chunk.content, document_title
                 )
-
-                # Optimisation: skip claims when no concepts found (saves 1 LLM call)
-                claims: List[Dict] = []
-                if concepts:
-                    concept_names = [c["concept_name"] for c in concepts]
-                    claims = await self.extract_claims(chunk.content, concept_names)
-
-                # Optimisation: skip per-chunk relationship extraction entirely.
-                # The RelationshipDetector service does a much better job at
-                # project level using cosine similarity + evidence + LLM.
-                # This saves ~33% of all LLM calls during extraction.
 
                 for c in concepts:
                     all_raw_concepts.append((c, chunk.id))
                 for cl in claims:
                     all_raw_claims.append((cl, chunk.id))
 
+                chunk.extraction_status = "extracted"
                 chunks_processed += 1
                 logger.info(
                     "Chunk %d/%d (id=%d): %d concepts, %d claims",

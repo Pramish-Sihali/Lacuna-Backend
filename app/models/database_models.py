@@ -125,6 +125,9 @@ class Chunk(Base):
     chunk_index = Column(Integer, nullable=False)  # Position in document
     embedding = Column(Vector(settings.VECTOR_DIMENSION), nullable=True)
     metadata_json = Column(JSON, nullable=True)  # Page number, section, etc.
+    # Resume support: tracks extraction status per chunk
+    # None = not yet processed, "extracted" = done, "skipped" = too short / boilerplate
+    extraction_status = Column(String(20), nullable=True)
 
     # Relationships
     document = relationship("Document", back_populates="chunks")

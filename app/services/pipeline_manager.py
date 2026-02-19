@@ -87,9 +87,14 @@ class PipelineManager:
         cls,
         project_id: int,
         coro: Coroutine[Any, Any, Any],
+        status: Optional[PipelineStatus] = None,
     ) -> PipelineStatus:
         """
         Launch a background pipeline task for *project_id*.
+
+        If *status* is provided (pre-created by the caller so it could be
+        passed into the coroutine before this method is called), it is
+        registered as-is.  Otherwise a fresh PipelineStatus is created.
 
         Returns the PipelineStatus object (shared with the running task so
         fields update in real time).
@@ -97,7 +102,8 @@ class PipelineManager:
         if cls.is_running(project_id):
             raise RuntimeError(f"Pipeline already running for project {project_id}")
 
-        status = PipelineStatus(project_id=project_id)
+        if status is None:
+            status = PipelineStatus(project_id=project_id)
         cls._status[project_id] = status
 
         async def _wrapper() -> None:

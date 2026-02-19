@@ -800,16 +800,22 @@ async def room_pipeline_start(
         )
         doc_count = doc_count_result.scalar() or 0
 
+    from app.services.pipeline_manager import PipelineStatus
+
+    # Pre-create the status so we can pass it into the coroutine AND to start()
+    # (get_status() would return None here because start() hasn't been called yet)
+    ps = PipelineStatus(project_id=project.id, total_documents=doc_count)
+
     pipeline = LacunaPipeline()
-    ps = pipeline_manager.start(
+    pipeline_manager.start(
         project.id,
         pipeline.process_all_phased(
             project.id,
-            pipeline_manager.get_status(project.id),
+            ps,
             document_ids=doc_ids,
         ),
+        status=ps,
     )
-    ps.total_documents = doc_count
 
     logger.info(
         "Room %d: phased pipeline started (%d documents%s)",
