@@ -80,6 +80,18 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
             logger.info("Database tables created/verified")
 
+            # Fix auto-increment sequences for tables that may have
+            # manually-inserted rows (e.g. DEFAULT_PROJECT_ID=1).
+            # Without this, PostgreSQL's nextval() can return an ID that
+            # already exists, causing IntegrityError on INSERT.
+            for table in ("projects", "documents", "chunks", "concepts",
+                          "claims", "relationships", "brain_state"):
+                await conn.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                    f"COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
+                ))
+            logger.info("Auto-increment sequences synced")
+
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         raise

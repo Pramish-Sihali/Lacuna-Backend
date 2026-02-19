@@ -66,6 +66,9 @@ from app.models.schemas import (
     GapTypeSchema,
     KnowledgeBuildResponse,
     PipelineProcessAllResponse,
+    PipelineStartRequest,
+    PipelineStartResponse,
+    PipelineStatusResponse,
     ProcessDocumentResponse,
     ReactFlowConceptMapResponse,
     ReactFlowEdge,
@@ -754,4 +757,91 @@ async def room_process_all(
         processing_time_seconds=elapsed,
         errors=errors,
         message=message,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROOM-SCOPED PHASED PIPELINE (BACKGROUND)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/{room_id}/pipeline/start", response_model=PipelineStartResponse)
+async def room_pipeline_start(
+    body: Optional[PipelineStartRequest] = None,
+    project: Project = Depends(get_authorized_project),
+    db: AsyncSession = Depends(get_db),
+) -> PipelineStartResponse:
+    """
+    Launch the phased pipeline as a background task for this room.
+
+    Optionally pass ``document_ids`` in the request body to only embed/extract
+    specific (newly uploaded) documents.  The knowledge rebuild always runs
+    across all project data.
+
+    Returns immediately. Poll ``GET .../pipeline/status`` for progress.
+    """
+    from app.services.pipeline_manager import pipeline_manager
+
+    if pipeline_manager.is_running(project.id):
+        existing = pipeline_manager.get_status(project.id)
+        return PipelineStartResponse(
+            status="already_running",
+            phase=existing.phase.value if existing else "unknown",
+            total_documents=existing.total_documents if existing else 0,
+        )
+
+    doc_ids = body.document_ids if body else None
+
+    # Count documents to process
+    if doc_ids:
+        doc_count = len(doc_ids)
+    else:
+        doc_count_result = await db.execute(
+            select(func.count(Document.id)).where(Document.project_id == project.id)
+        )
+        doc_count = doc_count_result.scalar() or 0
+
+    pipeline = LacunaPipeline()
+    ps = pipeline_manager.start(
+        project.id,
+        pipeline.process_all_phased(
+            project.id,
+            pipeline_manager.get_status(project.id),
+            document_ids=doc_ids,
+        ),
+    )
+    ps.total_documents = doc_count
+
+    logger.info(
+        "Room %d: phased pipeline started (%d documents%s)",
+        project.id, doc_count,
+        f", ids={doc_ids}" if doc_ids else " — all",
+    )
+
+    return PipelineStartResponse(
+        status="started",
+        phase=ps.phase.value,
+        total_documents=doc_count,
+    )
+
+
+@router.get("/{room_id}/pipeline/status", response_model=PipelineStatusResponse)
+async def room_pipeline_status(
+    project: Project = Depends(get_authorized_project),
+) -> PipelineStatusResponse:
+    """Poll the current phased pipeline status for this room."""
+    from app.services.pipeline_manager import pipeline_manager
+
+    status = pipeline_manager.get_status(project.id)
+    if status is None:
+        return PipelineStatusResponse(phase="idle")
+
+    return PipelineStatusResponse(
+        phase=status.phase.value,
+        total_documents=status.total_documents,
+        documents_embedded=status.documents_embedded,
+        documents_extracted=status.documents_extracted,
+        documents_failed=status.documents_failed,
+        current_document=status.current_document,
+        errors=status.errors,
+        elapsed_seconds=status.elapsed_seconds,
     )

@@ -199,7 +199,7 @@ class OllamaLLMService:
 
     MAX_CONCURRENT: int = 2
     MAX_JSON_RETRIES: int = 2
-    LLM_TIMEOUT: float = 120.0   # qwen2.5:3b can be slow on first token
+    LLM_TIMEOUT: float = float(settings.OLLAMA_TIMEOUT)  # default 300s from config
     MIN_CHUNK_WORDS: int = 50    # chunks shorter than this are skipped
 
     SPECIFICITY_TO_GENERALITY: Dict[str, float] = {
@@ -500,7 +500,6 @@ class OllamaLLMService:
         chunks_skipped = 0
         all_raw_concepts: List[Tuple[Dict, int]] = []   # (concept_dict, chunk_id)
         all_raw_claims: List[Tuple[Dict, int]] = []     # (claim_dict, chunk_id)
-        all_relationships: List[Dict] = []
         errors: List[str] = []
 
         for chunk in chunks:
@@ -517,28 +516,31 @@ class OllamaLLMService:
                 concepts = await self.extract_concepts(
                     chunk.content, document_title
                 )
-                concept_names = [c["concept_name"] for c in concepts]
 
-                claims = await self.extract_claims(chunk.content, concept_names)
-                relationships = await self.extract_relationships(
-                    chunk.content, document_title
-                )
+                # Optimisation: skip claims when no concepts found (saves 1 LLM call)
+                claims: List[Dict] = []
+                if concepts:
+                    concept_names = [c["concept_name"] for c in concepts]
+                    claims = await self.extract_claims(chunk.content, concept_names)
+
+                # Optimisation: skip per-chunk relationship extraction entirely.
+                # The RelationshipDetector service does a much better job at
+                # project level using cosine similarity + evidence + LLM.
+                # This saves ~33% of all LLM calls during extraction.
 
                 for c in concepts:
                     all_raw_concepts.append((c, chunk.id))
                 for cl in claims:
                     all_raw_claims.append((cl, chunk.id))
-                all_relationships.extend(relationships)
 
                 chunks_processed += 1
                 logger.info(
-                    "Chunk %d/%d (id=%d): %d concepts, %d claims, %d relationships",
+                    "Chunk %d/%d (id=%d): %d concepts, %d claims",
                     chunks_processed,
                     len(chunks),
                     chunk.id,
                     len(concepts),
                     len(claims),
-                    len(relationships),
                 )
 
             except Exception as exc:
@@ -673,17 +675,16 @@ class OllamaLLMService:
             concepts_extracted=len(all_raw_concepts),
             concepts_saved=new_concepts_count,
             claims_saved=claims_saved,
-            relationships_found=len(all_relationships),
+            relationships_found=0,  # relationships detected at project level, not per-chunk
             errors=errors,
         )
         logger.info(
             "process_document %d: %d chunks processed, "
-            "%d new concepts, %d claims, %d relationships",
+            "%d new concepts, %d claims",
             document_id,
             chunks_processed,
             new_concepts_count,
             claims_saved,
-            len(all_relationships),
         )
         return summary
 
@@ -757,13 +758,13 @@ class OllamaLLMService:
             response_text = await self._call_llm(current_prompt, max_tokens)
 
             if not response_text:
+                # Empty response means timeout or connection error — retrying
+                # the same call will likely time out again. Bail immediately.
                 logger.warning(
-                    "_call_llm_json: empty LLM response (attempt %d/%d)",
+                    "_call_llm_json: empty LLM response (attempt %d) — "
+                    "skipping retries (likely timeout)",
                     attempt,
-                    self.MAX_JSON_RETRIES,
                 )
-                if attempt < self.MAX_JSON_RETRIES:
-                    continue
                 return False, []
 
             success, parsed = self._parse_json_robust(response_text)

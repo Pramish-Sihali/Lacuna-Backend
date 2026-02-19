@@ -25,6 +25,7 @@ from typing import Any, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import AsyncSessionLocal
 from app.models.database_models import Document
 from app.services.brain_service import BrainService
 from app.services.clustering import ConceptClusterer
@@ -418,4 +419,112 @@ class LacunaPipeline:
             knowledge_result=knowledge_result,
             total_time_seconds=total_time,
             message=message,
+        )
+
+    # ------------------------------------------------------------------
+    # Phased batch pipeline (background task)
+    # ------------------------------------------------------------------
+
+    async def process_all_phased(
+        self,
+        project_id: int,
+        status: "PipelineStatus",
+        document_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Three-phase pipeline: embed → extract → rebuild knowledge.
+
+        If *document_ids* is provided, only those documents are embedded and
+        extracted (incremental mode — used when new papers are added to a room
+        that already has processed documents).  If ``None``, all documents in
+        the project are processed.
+
+        The knowledge rebuild (normalize → cluster → relationships → gaps →
+        brain) **always** runs across the entire project.
+
+        Designed to be run as an ``asyncio.Task`` via ``PipelineManager``.
+        The *status* object is mutated in-place so callers can poll progress.
+        """
+        from app.services.pipeline_manager import PipelinePhase
+
+        # Load documents to process
+        async with AsyncSessionLocal() as db:
+            stmt = select(Document).where(Document.project_id == project_id)
+            if document_ids is not None:
+                stmt = stmt.where(Document.id.in_(document_ids))
+            docs_result = await db.execute(stmt)
+            documents = list(docs_result.scalars().all())
+
+        status.total_documents = len(documents)
+
+        if not documents:
+            logger.info("process_all_phased: no documents to process for project %d", project_id)
+            # Still run knowledge rebuild if there are other docs in the project
+            if document_ids is not None:
+                # Skip straight to knowledge rebuild
+                pass
+            else:
+                status.phase = PipelinePhase.COMPLETED
+                return
+
+        # ── Phase 1: Embed documents ──────────────────────────────────
+        # embed_document_chunks already skips chunks with existing embeddings
+        if documents:
+            status.phase = PipelinePhase.EMBEDDING
+            for doc in documents:
+                async with AsyncSessionLocal() as session:
+                    try:
+                        status.current_document = doc.filename
+                        await self._embedder.embed_document_chunks(doc.id, session)
+                        status.documents_embedded += 1
+                    except Exception as exc:
+                        status.documents_failed += 1
+                        status.errors.append(f"embed {doc.filename}: {str(exc)[:120]}")
+                        logger.error("process_all_phased: embed failed doc %d: %s", doc.id, exc)
+
+        # ── Phase 2: Extract documents (LLM) ─────────────────────────
+        if documents:
+            status.phase = PipelinePhase.EXTRACTING
+            for doc in documents:
+                async with AsyncSessionLocal() as session:
+                    try:
+                        status.current_document = doc.filename
+                        await self._llm.process_document(doc.id, session)
+                        status.documents_extracted += 1
+                    except Exception as exc:
+                        status.documents_failed += 1
+                        status.errors.append(f"extract {doc.filename}: {str(exc)[:120]}")
+                        logger.error("process_all_phased: extract failed doc %d: %s", doc.id, exc)
+
+        # ── Phase 3: Rebuild knowledge (5 steps) ─────────────────────
+        status.current_document = None
+        knowledge_steps = [
+            (PipelinePhase.NORMALIZING, self._normalizer.normalize_project),
+            (PipelinePhase.CLUSTERING, self._clusterer.cluster_project),
+            (PipelinePhase.RELATIONSHIPS, self._rel_detector.detect_relationships),
+            (PipelinePhase.GAPS, self._gap_detector.detect_gaps),
+            (PipelinePhase.BRAIN, lambda pid, db: self._brain_service.build_brain(pid, db, clear_existing=False)),
+        ]
+
+        for phase_enum, step_fn in knowledge_steps:
+            status.phase = phase_enum
+            async with AsyncSessionLocal() as session:
+                try:
+                    await step_fn(project_id, session)
+                except Exception as exc:
+                    status.errors.append(f"{phase_enum.value}: {str(exc)[:120]}")
+                    logger.error(
+                        "process_all_phased: %s failed for project %d: %s",
+                        phase_enum.value, project_id, exc,
+                    )
+
+        status.phase = PipelinePhase.COMPLETED
+        logger.info(
+            "process_all_phased: completed for project %d — "
+            "%d embedded, %d extracted, %d failed in %.1fs",
+            project_id,
+            status.documents_embedded,
+            status.documents_extracted,
+            status.documents_failed,
+            status.elapsed_seconds,
         )

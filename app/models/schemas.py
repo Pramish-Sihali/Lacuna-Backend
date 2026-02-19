@@ -694,3 +694,30 @@ class PipelineProcessAllResponse(BaseModel):
     processing_time_seconds: float
     errors: List[str] = []
     message: str
+
+
+class PipelineStartRequest(BaseModel):
+    """Optional request body for POST /api/pipeline/start."""
+
+    document_ids: Optional[List[int]] = None  # If provided, only process these docs
+
+
+class PipelineStartResponse(BaseModel):
+    """Response for POST /api/pipeline/start (background pipeline)."""
+
+    status: str  # "started" or "already_running"
+    phase: str
+    total_documents: int
+
+
+class PipelineStatusResponse(BaseModel):
+    """Response for GET /api/pipeline/status (pipeline progress polling)."""
+
+    phase: str  # idle/queued/embedding/extracting/normalizing/.../completed/failed
+    total_documents: int = 0
+    documents_embedded: int = 0
+    documents_extracted: int = 0
+    documents_failed: int = 0
+    current_document: Optional[str] = None
+    errors: List[str] = []
+    elapsed_seconds: Optional[float] = None

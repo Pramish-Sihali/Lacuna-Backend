@@ -19,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal, get_db
 from app.models.database_models import Document
-from app.models.schemas import KnowledgeBuildResponse, PipelineProcessAllResponse
+from app.models.schemas import (
+    KnowledgeBuildResponse,
+    PipelineProcessAllResponse,
+    PipelineStartRequest,
+    PipelineStartResponse,
+    PipelineStatusResponse,
+)
 from app.services.pipeline import LacunaPipeline
 
 logger = logging.getLogger(__name__)
@@ -228,4 +234,100 @@ async def full_rebuild(db: AsyncSession = Depends(get_db)) -> KnowledgeBuildResp
         brain_summary=knowledge.brain_summary,
         processing_time_seconds=elapsed,
         message=f"[Full Rebuild] {knowledge.message}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /start  — launch phased pipeline as background task (unscoped / demo)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/start",
+    response_model=PipelineStartResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Start phased background pipeline (demo mode)",
+)
+async def pipeline_start(
+    body: PipelineStartRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> PipelineStartResponse:
+    """
+    Launch the phased pipeline for the default project as a background task.
+
+    Optionally pass ``document_ids`` to only process specific documents.
+    Returns immediately.  Poll ``GET /api/pipeline/status`` for progress.
+    """
+    from sqlalchemy import func as sqla_func
+
+    from app.services.pipeline_manager import pipeline_manager
+
+    project_id = settings.DEFAULT_PROJECT_ID
+
+    if pipeline_manager.is_running(project_id):
+        existing = pipeline_manager.get_status(project_id)
+        return PipelineStartResponse(
+            status="already_running",
+            phase=existing.phase.value if existing else "unknown",
+            total_documents=existing.total_documents if existing else 0,
+        )
+
+    doc_ids = body.document_ids if body else None
+
+    if doc_ids:
+        doc_count = len(doc_ids)
+    else:
+        doc_count_result = await db.execute(
+            select(sqla_func.count(Document.id)).where(Document.project_id == project_id)
+        )
+        doc_count = doc_count_result.scalar() or 0
+
+    pipeline = LacunaPipeline()
+    ps = pipeline_manager.start(
+        project_id,
+        pipeline.process_all_phased(
+            project_id,
+            pipeline_manager.get_status(project_id),
+            document_ids=doc_ids,
+        ),
+    )
+    ps.total_documents = doc_count
+
+    logger.info("Demo pipeline started for project %d (%d documents)", project_id, doc_count)
+
+    return PipelineStartResponse(
+        status="started",
+        phase=ps.phase.value,
+        total_documents=doc_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /status  — poll phased pipeline progress (unscoped / demo)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/status",
+    response_model=PipelineStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Poll phased pipeline status (demo mode)",
+)
+async def pipeline_status_poll() -> PipelineStatusResponse:
+    """Return the current phased pipeline status for the default project."""
+    from app.services.pipeline_manager import pipeline_manager
+
+    project_id = settings.DEFAULT_PROJECT_ID
+    ps = pipeline_manager.get_status(project_id)
+
+    if ps is None:
+        return PipelineStatusResponse(phase="idle")
+
+    return PipelineStatusResponse(
+        phase=ps.phase.value,
+        total_documents=ps.total_documents,
+        documents_embedded=ps.documents_embedded,
+        documents_extracted=ps.documents_extracted,
+        documents_failed=ps.documents_failed,
+        current_document=ps.current_document,
+        errors=ps.errors,
+        elapsed_seconds=ps.elapsed_seconds,
     )
