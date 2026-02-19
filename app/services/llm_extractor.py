@@ -830,48 +830,78 @@ class OllamaLLMService:
 
     async def _call_llm(self, prompt: str, max_tokens: int = 1000) -> str:
         """
-        POST to Ollama /api/generate and return the response text.
+        Dispatch to Groq (if GROQ_API is set) or local Ollama.
 
         Uses semaphore to cap concurrent LLM calls.  Returns empty string
         on any error (timeout, connection failure, non-200 response).
         """
         async with self._semaphore:
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/api/generate",
-                        json={
-                            "model": self.model,
-                            "prompt": prompt,
-                            "stream": False,
-                            "options": {
-                                "num_predict": max_tokens,
-                                "temperature": 0.1,  # low temp for deterministic JSON
-                            },
+            if settings.GROQ_API:
+                return await self._call_groq(prompt, max_tokens)
+            return await self._call_ollama(prompt, max_tokens)
+
+    async def _call_groq(self, prompt: str, max_tokens: int = 1000) -> str:
+        """POST to Groq chat completions (OpenAI-compatible) and return the text."""
+        try:
+            timeout = httpx.Timeout(float(settings.GROQ_TIMEOUT), connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.GROQ_API}"},
+                    json={
+                        "model": settings.GROQ_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": 0.1,
+                    },
+                )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            logger.error(
+                "_call_groq: HTTP %d: %s", resp.status_code, resp.text[:300]
+            )
+            return ""
+        except httpx.TimeoutException:
+            logger.error("_call_groq: timed out after %.0fs", float(settings.GROQ_TIMEOUT))
+            return ""
+        except httpx.ConnectError as exc:
+            logger.error("_call_groq: connection error — %s", exc)
+            return ""
+        except Exception as exc:
+            logger.error("_call_groq: unexpected error — %s", exc)
+            return ""
+
+    async def _call_ollama(self, prompt: str, max_tokens: int = 1000) -> str:
+        """POST to local Ollama /api/generate and return the response text."""
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "num_predict": max_tokens,
+                            "temperature": 0.1,
                         },
-                    )
-
-                if resp.status_code == 200:
-                    return resp.json().get("response", "")
-
-                logger.error(
-                    "_call_llm: Ollama returned HTTP %d: %s",
-                    resp.status_code,
-                    resp.text[:300],
+                    },
                 )
-                return ""
-
-            except httpx.TimeoutException:
-                logger.error(
-                    "_call_llm: request timed out after %.0f s", self.LLM_TIMEOUT
-                )
-                return ""
-            except httpx.ConnectError as exc:
-                logger.error("_call_llm: connection error — %s", exc)
-                return ""
-            except Exception as exc:
-                logger.error("_call_llm: unexpected error — %s", exc)
-                return ""
+            if resp.status_code == 200:
+                return resp.json().get("response", "")
+            logger.error(
+                "_call_ollama: HTTP %d: %s", resp.status_code, resp.text[:300]
+            )
+            return ""
+        except httpx.TimeoutException:
+            logger.error("_call_ollama: timed out after %.0fs", self.LLM_TIMEOUT)
+            return ""
+        except httpx.ConnectError as exc:
+            logger.error("_call_ollama: connection error — %s", exc)
+            return ""
+        except Exception as exc:
+            logger.error("_call_ollama: unexpected error — %s", exc)
+            return ""
 
     async def _call_llm_json(
         self,

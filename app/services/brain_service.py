@@ -368,7 +368,36 @@ class BrainService:
         return raw.strip() if raw else "Insufficient data to generate synthesis."
 
     async def _call_llm(self, prompt: str, max_tokens: int = 500) -> str:
-        """POST to Ollama /api/generate and return the response text."""
+        """Dispatch to Groq (if GROQ_API is set) or local Ollama."""
+        if settings.GROQ_API:
+            return await self._call_groq(prompt, max_tokens)
+        return await self._call_ollama(prompt, max_tokens)
+
+    async def _call_groq(self, prompt: str, max_tokens: int = 500) -> str:
+        """POST to Groq chat completions (OpenAI-compatible) and return the text."""
+        try:
+            timeout = httpx.Timeout(float(settings.GROQ_TIMEOUT), connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.GROQ_API}"},
+                    json={
+                        "model": settings.GROQ_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": 0.3,
+                    },
+                )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            logger.error("_call_groq: HTTP %d: %s", resp.status_code, resp.text[:200])
+            return ""
+        except Exception as exc:
+            logger.error("_call_groq error: %s", exc)
+            return ""
+
+    async def _call_ollama(self, prompt: str, max_tokens: int = 500) -> str:
+        """POST to local Ollama /api/generate and return the response text."""
         payload = {
             "model": settings.OLLAMA_LLM_MODEL,
             "prompt": prompt,
@@ -383,11 +412,11 @@ class BrainService:
                     json=payload,
                 )
             if resp.status_code != 200:
-                logger.error("LLM /api/generate returned %d: %s", resp.status_code, resp.text[:200])
+                logger.error("_call_ollama returned %d: %s", resp.status_code, resp.text[:200])
                 return ""
             return resp.json().get("response", "")
         except Exception as exc:
-            logger.error("_call_llm error: %s", exc)
+            logger.error("_call_ollama error: %s", exc)
             return ""
 
     # ------------------------------------------------------------------

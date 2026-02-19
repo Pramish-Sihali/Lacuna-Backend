@@ -12,11 +12,16 @@ class Settings(BaseSettings):
     # Database Configuration
     DATABASE_URL: str = "postgresql+asyncpg://lacuna_user:lacuna_password@localhost:5432/lacuna_db"
 
-    # Ollama Configuration
+    # Ollama Configuration (embeddings only when Groq is active)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     OLLAMA_LLM_MODEL: str = "qwen2.5:3b"
     OLLAMA_TIMEOUT: int = 300  # 5 minutes for LLM requests
+
+    # Groq Configuration (LLM calls — OpenAI-compatible API)
+    GROQ_API: str = ""
+    GROQ_MODEL: str = "llama-3.1-8b-instant"
+    GROQ_TIMEOUT: int = 60
 
     # Vector Configuration
     VECTOR_DIMENSION: int = 768  # nomic-embed-text outputs 768-dimensional vectors
