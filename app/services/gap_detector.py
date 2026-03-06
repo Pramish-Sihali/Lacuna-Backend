@@ -80,24 +80,23 @@ class GapDetectionResult:
 _EXPECTED_TOPICS_PROMPT = """\
 You are a research domain expert analyzing a collection of academic documents.
 
-The following concepts have been identified in this collection:
+The following HIGH-LEVEL topics have been identified in this collection:
 {concept_list_with_descriptions}
 
 These concepts span the domain of: {inferred_domain}
 
-Based on your knowledge of this domain, what important related concepts are MISSING \
-from this collection? These should be topics that a comprehensive understanding of \
-this domain would require but are not covered.
+Identify the most CRITICAL missing topics — fundamental gaps whose absence makes \
+the collection seriously incomplete. Be very selective: only return concepts that \
+are truly essential, not merely interesting additions.
 
 For each missing concept provide:
-1. concept_name: Clear name (2-5 words)
-2. description: Why this concept is important for this domain (1-2 sentences)
+1. concept_name: Clear, broad name (2-5 words, high-level topic)
+2. description: Why this topic is critically absent (1-2 sentences)
 3. related_to: Which existing concepts this would connect to (list of names)
-4. importance: "critical" (fundamental gap), "important" (notable absence), \
-or "nice_to_have" (would enhance completeness)
+4. importance: MUST be "critical" — only return gaps that are truly fundamental
 
-Return between 3 and {max_gaps} missing concepts. Do NOT suggest concepts that \
-already appear in the list above.
+Return at most {max_gaps} missing concepts. Only include "critical" importance gaps. \
+Do NOT suggest concepts already in the list above.
 
 Respond ONLY with valid JSON array — nothing else:
 [{{"concept_name": "...", "description": "...", "related_to": ["..."], "importance": "critical"}}]\
@@ -154,12 +153,12 @@ class GapDetector:
     # ---- tunables ----------------------------------------------------------
     WEAK_COVERAGE_THRESHOLD: float = 0.20   # coverage below this = weak
     WEAK_GENERALITY_MIN: float = 0.50       # generality above this = broad concept
-    MIN_DOCS_FOR_WEAK_COVERAGE: int = 3     # skip pass 3 for tiny collections
-    BRIDGE_SIM_THRESHOLD: float = 0.40      # min centroid cosine sim to flag a bridge gap
-    MAX_EXPECTED_GAPS: int = 8              # max expected-topic gap concepts to create
-    MAX_BRIDGING_PAIRS: int = 5             # max cluster pairs to generate bridge gaps for
-    TOP_CONCEPTS_FOR_PROMPT: int = 25       # concept cap for the expected-topics prompt
-    TOP_DOMAIN_CONCEPTS: int = 8            # highest-generality concepts used to infer domain
+    MIN_DOCS_FOR_WEAK_COVERAGE: int = 5     # skip pass 3 for small collections
+    BRIDGE_SIM_THRESHOLD: float = 0.55      # raised: only flag very closely related clusters
+    MAX_EXPECTED_GAPS: int = 3              # max expected-topic gap concepts to create
+    MAX_BRIDGING_PAIRS: int = 2             # max cluster pairs to generate bridge gaps for
+    TOP_CONCEPTS_FOR_PROMPT: int = 15       # concept cap for the expected-topics prompt
+    TOP_DOMAIN_CONCEPTS: int = 5            # highest-generality concepts used to infer domain
     # -----------------------------------------------------------------------
 
     def __init__(self) -> None:
@@ -433,6 +432,15 @@ class GapDetector:
             importance = str(item.get("importance", "important")).lower()
             if importance not in {"critical", "important", "nice_to_have"}:
                 importance = "important"
+
+            # Only create gap nodes for critical gaps — avoids visual clutter
+            if importance != "critical":
+                logger.debug(
+                    "GapDetector: skipping non-critical gap '%s' (importance=%s)",
+                    name,
+                    importance,
+                )
+                continue
 
             # Embed the gap concept so it can be positioned on the map
             embed_text = f"{name} {description}".strip()

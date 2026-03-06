@@ -153,7 +153,7 @@ class Concept(Base):
 
     # Gap detection
     is_gap = Column(Boolean, default=False, nullable=False, index=True)
-    gap_type = Column(SQLEnum(GapType), nullable=True)
+    gap_type = Column(SQLEnum(GapType, values_callable=lambda e: [x.value for x in e]), nullable=True)
 
     # Hierarchy
     parent_concept_id = Column(Integer, ForeignKey("concepts.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -189,7 +189,7 @@ class Claim(Base):
     document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
     concept_id = Column(Integer, ForeignKey("concepts.id", ondelete="CASCADE"), nullable=False, index=True)
     claim_text = Column(Text, nullable=False)
-    claim_type = Column(SQLEnum(ClaimType), nullable=False)
+    claim_type = Column(SQLEnum(ClaimType, values_callable=lambda e: [x.value for x in e]), nullable=False)
     confidence = Column(Float, nullable=True)  # LLM confidence in extraction
     embedding = Column(Vector(settings.VECTOR_DIMENSION), nullable=True)
 
@@ -210,7 +210,7 @@ class Relationship(Base):
     target_concept_id = Column(
         Integer, ForeignKey("concepts.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    relationship_type = Column(SQLEnum(RelationshipType), nullable=False)
+    relationship_type = Column(SQLEnum(RelationshipType, values_callable=lambda e: [x.value for x in e]), nullable=False)
     strength = Column(Float, nullable=True)  # 0-1 score
     confidence = Column(Float, nullable=True)  # How confident we are
     evidence_json = Column(JSON, nullable=True)  # Supporting evidence

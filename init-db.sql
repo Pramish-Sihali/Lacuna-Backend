@@ -131,6 +131,19 @@ CREATE TABLE IF NOT EXISTS brain_state (
 CREATE INDEX IF NOT EXISTS ix_brain_state_id ON brain_state (id);
 CREATE INDEX IF NOT EXISTS ix_brain_state_project_id ON brain_state (project_id);
 
+-- ── nextauth_users ───────────────────────────────────────────────────────────
+-- Used by NextAuth Credentials provider for email/password auth.
+CREATE TABLE IF NOT EXISTS nextauth_users (
+    id              VARCHAR(255) PRIMARY KEY,
+    name            VARCHAR(255),
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    password        VARCHAR(255),
+    email_verified  TIMESTAMPTZ,
+    image           TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_nextauth_users_email ON nextauth_users (email);
+
 -- ── Default demo project ────────────────────────────────────────────────────
 -- Used by the unscoped (legacy) endpoints when no X-User-Id header is sent.
 INSERT INTO projects (id, name, description)

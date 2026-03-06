@@ -130,6 +130,26 @@ class PipelineManager:
         return status
 
     @classmethod
+    def cancel(cls, project_id: int) -> bool:
+        """
+        Cancel a running pipeline task for *project_id*.
+
+        Returns True if a task was found and cancelled, False if no task
+        was running.  The task's done-callback will clean up ``_tasks``
+        and mark the status as FAILED automatically.
+        """
+        task = cls._tasks.get(project_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        status = cls._status.get(project_id)
+        if status:
+            status.phase = PipelinePhase.FAILED
+            status.errors.append("Cancelled by user.")
+        logger.info("Pipeline task cancelled for project %d", project_id)
+        return True
+
+    @classmethod
     def _cleanup(cls, project_id: int) -> None:
         """Remove the task reference (status is kept for polling)."""
         cls._tasks.pop(project_id, None)

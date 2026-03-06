@@ -45,6 +45,7 @@ from app.models.database_models import (
     Relationship,
     RelationshipType,
 )
+from app.config import settings
 from app.services.llm_extractor import OllamaLLMService
 from app.utils.helpers import cosine_similarity
 
@@ -469,7 +470,7 @@ class RelationshipDetector:
             try:
                 embs_raw.append(list(c.embedding))
             except (TypeError, ValueError):
-                embs_raw.append([0.0] * 768)
+                embs_raw.append([0.0] * settings.VECTOR_DIMENSION)
 
         embs = np.array(embs_raw, dtype=np.float32)
 

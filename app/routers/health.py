@@ -22,7 +22,7 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     Health check endpoint to verify system status.
 
     Returns:
-        HealthCheckResponse with status of database and Ollama
+        HealthCheckResponse with status of database and Bedrock
     """
     # Check database connection
     db_status = "ok"
@@ -32,23 +32,23 @@ async def health_check(db: AsyncSession = Depends(get_db)):
         logger.error(f"Database health check failed: {e}")
         db_status = "error"
 
-    # Check Ollama connection
-    ollama_status = "ok"
+    # Check AWS Bedrock connection
+    bedrock_status = "ok"
     try:
         embedding_service = EmbeddingService()
-        is_healthy = await embedding_service.check_ollama_health()
+        is_healthy = await embedding_service.check_bedrock_health()
         if not is_healthy:
-            ollama_status = "error"
+            bedrock_status = "error"
     except Exception as e:
-        logger.error(f"Ollama health check failed: {e}")
-        ollama_status = "error"
+        logger.error(f"Bedrock health check failed: {e}")
+        bedrock_status = "error"
 
     # Overall status
-    overall_status = "healthy" if db_status == "ok" and ollama_status == "ok" else "degraded"
+    overall_status = "healthy" if db_status == "ok" and bedrock_status == "ok" else "degraded"
 
     return HealthCheckResponse(
         status=overall_status,
         database=db_status,
-        ollama=ollama_status,
+        ollama=bedrock_status,
         timestamp=datetime.utcnow()
     )

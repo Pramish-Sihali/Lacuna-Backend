@@ -282,26 +282,47 @@ async def room_upload_document(
         db.add(document)
         await db.flush()
 
-        chunker = ChunkingService()
-        chunks = await chunker.chunk_document(parsed_doc, metadata={"filename": file.filename})
-        for chunk_data in chunks:
+        # Small-doc fast path: skip chunking, store full text as one chunk
+        is_small = len(parsed_doc.full_text) <= settings.SMALL_DOC_CHAR_THRESHOLD
+        meta = dict(document.metadata_json or {})
+        meta["is_small_doc"] = is_small
+        document.metadata_json = meta
+
+        if is_small:
             db.add(Chunk(
                 document_id=document.id,
-                content=chunk_data["content"],
-                chunk_index=chunk_data["chunk_index"],
+                content=parsed_doc.full_text,
+                chunk_index=0,
                 embedding=None,
-                metadata_json=chunk_data.get("metadata"),
+                metadata_json={"filename": file.filename, "whole_document": True},
             ))
+            chunk_count = 1
+            logger.info(
+                "Room %d: small doc fast path — %r stored as doc id=%d with 1 whole-document chunk",
+                project.id, file.filename, document.id,
+            )
+        else:
+            chunker = ChunkingService()
+            chunks = await chunker.chunk_document(parsed_doc, metadata={"filename": file.filename})
+            for chunk_data in chunks:
+                db.add(Chunk(
+                    document_id=document.id,
+                    content=chunk_data["content"],
+                    chunk_index=chunk_data["chunk_index"],
+                    embedding=None,
+                    metadata_json=chunk_data.get("metadata"),
+                ))
+            chunk_count = len(chunks)
 
         await db.flush()
-        logger.info("Room %d: uploaded %r as doc id=%d (%d chunks)", project.id, file.filename, document.id, len(chunks))
+        logger.info("Room %d: uploaded %r as doc id=%d (%d chunks)", project.id, file.filename, document.id, chunk_count)
 
         return DocumentUploadResponse(
             id=document.id,
             filename=document.filename,
             file_type=document.file_type,
             status="processed",
-            message=f"Document uploaded and parsed. {len(chunks)} chunks created.",
+            message=f"Document uploaded and parsed. {chunk_count} chunks created.",
         )
 
     except HTTPException:
@@ -473,8 +494,33 @@ async def room_get_concept_map(
     concept_res = await db.execute(
         select(Concept).where(Concept.project_id == project.id)
     )
-    concepts: List[Concept] = list(concept_res.scalars().all())
+    all_concepts: List[Concept] = list(concept_res.scalars().all())
 
+    # Apply the same hard caps as the unscoped /map endpoint
+    real_concepts = [c for c in all_concepts if not c.is_gap]
+    gap_concepts  = [c for c in all_concepts if c.is_gap]
+
+    MAX_CONCEPT = getattr(settings, "MAP_MAX_CONCEPT_NODES", 20)
+    MAX_GAP     = getattr(settings, "MAP_MAX_GAP_NODES", 3)
+
+    if len(real_concepts) > MAX_CONCEPT:
+        def _rank(c: Concept) -> float:
+            cov = c.coverage_score or 0.0
+            gen = c.generality_score or 0.0
+            is_head = 1.0 if c.parent_concept_id is None else 0.0
+            return cov * 0.4 + gen * 0.3 + is_head * 0.3
+        real_concepts = sorted(real_concepts, key=_rank, reverse=True)[:MAX_CONCEPT]
+
+    if len(gap_concepts) > MAX_GAP:
+        _imp_order = {"critical": 0, "important": 1, "nice_to_have": 2}
+        gap_concepts = sorted(
+            gap_concepts,
+            key=lambda c: _imp_order.get(
+                (c.metadata_json or {}).get("importance", "important"), 1
+            ),
+        )[:MAX_GAP]
+
+    concepts: List[Concept] = real_concepts + gap_concepts
     concept_ids_in_project = {c.id for c in concepts}
     rel_res = await db.execute(
         select(Relationship).where(Relationship.source_concept_id.in_(concept_ids_in_project))
@@ -851,3 +897,14 @@ async def room_pipeline_status(
         errors=status.errors,
         elapsed_seconds=status.elapsed_seconds,
     )
+
+
+@router.post("/{room_id}/pipeline/cancel", response_model=None, status_code=200)
+async def room_pipeline_cancel(
+    project: Project = Depends(get_authorized_project),
+) -> dict:
+    """Cancel the running background pipeline for this room."""
+    from app.services.pipeline_manager import pipeline_manager
+
+    cancelled = pipeline_manager.cancel(project.id)
+    return {"cancelled": cancelled, "project_id": project.id}

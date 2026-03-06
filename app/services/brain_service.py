@@ -8,11 +8,14 @@ BrainService.chat(question, project_id, db, top_k=5)              -> ChatResult
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import json
 import logging
 from typing import Any, Dict, List, Optional, Set
 
-import httpx
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +28,7 @@ from app.models.database_models import (
     Document,
     Relationship,
 )
-from app.services.embedding import OllamaEmbeddingService
+from app.services.embedding import BedrockEmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +142,14 @@ class BrainService:
     }
 
     def __init__(self) -> None:
-        self._embedder = OllamaEmbeddingService()
+        self._embedder = BedrockEmbeddingService()
+        self._llm_model = settings.AWS_BEDROCK_LLM_MODEL
+        self._llm_client = boto3.client(
+            "bedrock-runtime",
+            region_name=settings.AWS_REGION,
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -220,7 +230,7 @@ class BrainService:
         if q_emb is None:
             return ChatResult(
                 question=question,
-                answer="Unable to embed the question (Ollama may be unavailable).",
+                answer="Unable to embed the question (Bedrock may be unavailable).",
                 sources=[],
                 relevant_concepts=[],
                 confidence=0.0,
@@ -235,6 +245,11 @@ class BrainService:
             c for c in all_chunks if c["document_id"] in project_doc_ids
         ][:top_k]
 
+        # 2b — load full text of small docs in the project
+        small_doc_contexts = await self._load_small_doc_contexts(
+            project_id, db, q_emb=q_emb
+        )
+
         # 3 — relevant concepts via pgvector
         relevant_concepts = await self._find_relevant_concepts(
             q_emb, project_id, db, top_k=top_k
@@ -246,9 +261,13 @@ class BrainService:
         gaps = await self._load_gaps_for(project_id, db)
 
         # 5 — build prompt + LLM call
+        chunk_text = self._format_chunks(similar_chunks) or "(none)"
+        if small_doc_contexts:
+            chunk_text += "\n\n" + self._format_small_docs(small_doc_contexts)
+
         prompt = _CHAT_PROMPT.format(
             question=question,
-            chunks=self._format_chunks(similar_chunks) or "(none)",
+            chunks=chunk_text,
             concepts=self._format_concepts(relevant_concepts) or "(none)",
             claims=self._format_claims(claims) or "(none)",
             gaps=self._format_gaps(gaps),
@@ -261,6 +280,10 @@ class BrainService:
             else 0.3
         )
         sources = list({c["filename"] for c in similar_chunks})
+        # Include small doc filenames in sources
+        for sd in small_doc_contexts:
+            if sd["filename"] not in sources:
+                sources.append(sd["filename"])
         concept_names = [c["name"] for c in relevant_concepts]
 
         return ChatResult(
@@ -368,55 +391,31 @@ class BrainService:
         return raw.strip() if raw else "Insufficient data to generate synthesis."
 
     async def _call_llm(self, prompt: str, max_tokens: int = 500) -> str:
-        """Dispatch to Groq (if GROQ_API is set) or local Ollama."""
-        if settings.GROQ_API:
-            return await self._call_groq(prompt, max_tokens)
-        return await self._call_ollama(prompt, max_tokens)
-
-    async def _call_groq(self, prompt: str, max_tokens: int = 500) -> str:
-        """POST to Groq chat completions (OpenAI-compatible) and return the text."""
+        """Call AWS Bedrock (Nova Lite) via the Converse API."""
         try:
-            timeout = httpx.Timeout(float(settings.GROQ_TIMEOUT), connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.GROQ_API}"},
-                    json={
-                        "model": settings.GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
+            def _invoke():
+                resp = self._llm_client.converse(
+                    modelId=self._llm_model,
+                    messages=[{
+                        "role": "user",
+                        "content": [{"text": prompt}],
+                    }],
+                    inferenceConfig={
+                        "maxTokens": max_tokens,
                         "temperature": 0.3,
                     },
                 )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"]
-            logger.error("_call_groq: HTTP %d: %s", resp.status_code, resp.text[:200])
-            return ""
-        except Exception as exc:
-            logger.error("_call_groq error: %s", exc)
-            return ""
+                return resp["output"]["message"]["content"][0]["text"]
 
-    async def _call_ollama(self, prompt: str, max_tokens: int = 500) -> str:
-        """POST to local Ollama /api/generate and return the response text."""
-        payload = {
-            "model": settings.OLLAMA_LLM_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_predict": max_tokens, "temperature": 0.3},
-        }
-        timeout = httpx.Timeout(settings.OLLAMA_TIMEOUT, connect=10.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    f"{settings.OLLAMA_BASE_URL}/api/generate",
-                    json=payload,
-                )
-            if resp.status_code != 200:
-                logger.error("_call_ollama returned %d: %s", resp.status_code, resp.text[:200])
-                return ""
-            return resp.json().get("response", "")
+            return await asyncio.to_thread(_invoke)
+        except EndpointConnectionError as exc:
+            logger.error("_call_llm: Bedrock connection error — %s", exc)
+            return ""
+        except ClientError as exc:
+            logger.error("_call_llm: Bedrock client error — %s", exc)
+            return ""
         except Exception as exc:
-            logger.error("_call_ollama error: %s", exc)
+            logger.error("_call_llm: unexpected error — %s", exc)
             return ""
 
     # ------------------------------------------------------------------
@@ -489,6 +488,52 @@ class BrainService:
             .where(Concept.project_id == project_id)
         )
         return result.scalar() or 0
+
+    async def _load_small_doc_contexts(
+        self,
+        project_id: int,
+        db: AsyncSession,
+        q_emb: Optional[List[float]] = None,
+        max_docs: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Load full text of small documents in the project for RAG context.
+
+        If *q_emb* is provided and documents have document-level embeddings,
+        results are sorted by cosine similarity to the question. Otherwise
+        documents are returned in order of creation.
+
+        Returns at most *max_docs* entries.
+        """
+        result = await db.execute(
+            select(Document)
+            .where(Document.project_id == project_id)
+            .order_by(Document.created_at.desc())
+        )
+        docs = result.scalars().all()
+
+        small_docs = []
+        for doc in docs:
+            meta = doc.metadata_json or {}
+            if meta.get("is_small_doc") and doc.content_text:
+                entry: Dict[str, Any] = {
+                    "filename": doc.filename,
+                    "content": doc.content_text,
+                    "document_id": doc.id,
+                }
+                # Optionally compute similarity for ranking
+                doc_emb = meta.get("document_embedding")
+                if q_emb and doc_emb:
+                    entry["similarity"] = await self._embedder.compute_similarity(
+                        q_emb, doc_emb
+                    )
+                else:
+                    entry["similarity"] = 0.0
+                small_docs.append(entry)
+
+        # Sort by similarity (descending) if embeddings were available
+        small_docs.sort(key=lambda d: d["similarity"], reverse=True)
+        return small_docs[:max_docs]
 
     async def _get_project_doc_ids(
         self, project_id: int, db: AsyncSession
@@ -602,6 +647,15 @@ class BrainService:
         parts = []
         for c in claims[:12]:
             parts.append(f"- [{c['claim_type']}] {c['claim_text'][:200]}")
+        return "\n".join(parts)
+
+    def _format_small_docs(self, small_docs: List[Dict[str, Any]]) -> str:
+        """Format small document full texts for the RAG prompt."""
+        parts = []
+        for i, sd in enumerate(small_docs, 1):
+            # Cap per-doc content to avoid prompt overflow
+            content = sd["content"][:4000].replace("\n", " ")
+            parts.append(f"[Full Doc {i}] ({sd['filename']}) {content}")
         return "\n".join(parts)
 
     def _format_gaps(self, gaps: List[Dict[str, Any]]) -> str:

@@ -12,24 +12,24 @@ class Settings(BaseSettings):
     # Database Configuration
     DATABASE_URL: str = "postgresql+asyncpg://lacuna_user:lacuna_password@localhost:5432/lacuna_db"
 
-    # Ollama Configuration (embeddings only when Groq is active)
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
-    OLLAMA_LLM_MODEL: str = "qwen2.5:3b"
-    OLLAMA_TIMEOUT: int = 300  # 5 minutes for LLM requests
-
-    # Groq Configuration (LLM calls — OpenAI-compatible API)
-    GROQ_API: str = ""
-    GROQ_MODEL: str = "llama-3.1-8b-instant"
-    GROQ_TIMEOUT: int = 60
+    # AWS Bedrock Configuration
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = "us-east-1"
+    AWS_BEDROCK_EMBED_MODEL: str = "amazon.titan-embed-text-v2:0"
+    AWS_BEDROCK_LLM_MODEL: str = "amazon.nova-lite-v1:0"
+    AWS_BEDROCK_TIMEOUT: int = 120  # seconds for LLM requests
 
     # Vector Configuration
-    VECTOR_DIMENSION: int = 768  # nomic-embed-text outputs 768-dimensional vectors
+    VECTOR_DIMENSION: int = 1024  # Titan Embeddings V2 outputs 1024-dimensional vectors
 
     # Application Settings
     UPLOAD_DIR: str = "./uploads"
     CHUNK_SIZE: int = 500  # tokens
     CHUNK_OVERLAP: int = 50  # tokens
+    SMALL_DOC_CHAR_THRESHOLD: int = 8000  # Docs <= this skip chunking & chunk embedding
+    SMALL_DOC_MAX_CONCEPTS: int = 8       # Max concepts from whole-doc extraction
+    SMALL_DOC_MIN_CONCEPTS: int = 5       # Min concepts from whole-doc extraction
     DEFAULT_PROJECT_ID: int = 1
 
     # Server Configuration
@@ -54,13 +54,22 @@ class Settings(BaseSettings):
     MIN_COVERAGE_THRESHOLD: float = 0.3
 
     # Concept Normalisation Configuration
-    # Cosine-similarity threshold above which two concepts are considered the same
-    CONCEPT_SIMILARITY_THRESHOLD: float = 0.85
+    # Cosine-similarity threshold above which two concepts are considered the same.
+    # Lower = more aggressive merging (0.72 merges "neural networks" ↔ "deep learning").
+    CONCEPT_SIMILARITY_THRESHOLD: float = 0.72
     # Relaxed threshold used when the project has fewer than
     # CONCEPT_SMALL_PROJECT_THRESHOLD concepts
-    CONCEPT_SIMILARITY_THRESHOLD_SMALL: float = 0.80
-    # Projects with fewer concepts than this use the small-project threshold
-    CONCEPT_SMALL_PROJECT_THRESHOLD: int = 5
+    CONCEPT_SIMILARITY_THRESHOLD_SMALL: float = 0.68
+    # Projects with fewer concepts than this use the small-project threshold.
+    # Set to 50 so the relaxed threshold fires for typical 10-paper collections.
+    CONCEPT_SMALL_PROJECT_THRESHOLD: int = 50
+
+    # Minimum LLM extraction confidence to accept a concept (0.0-1.0)
+    MIN_CONCEPT_CONFIDENCE: float = 0.75
+
+    # /api/concepts/map hard caps
+    MAP_MAX_CONCEPT_NODES: int = 20  # cap on non-gap nodes returned to frontend
+    MAP_MAX_GAP_NODES: int = 3       # cap on gap nodes returned to frontend
 
     # Clustering Configuration (advanced)
     # Cosine similarity above which two concepts in different clusters are linked

@@ -165,6 +165,12 @@ def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> f
     return numerator / denominator if denominator != 0 else default
 
 
+def is_small_doc(document) -> bool:
+    """Check whether a document was flagged as small at upload time."""
+    meta = document.metadata_json or {}
+    return bool(meta.get("is_small_doc", False))
+
+
 def truncate_text(text: str, max_length: int = 200, suffix: str = "...") -> str:
     """
     Truncate text to maximum length.

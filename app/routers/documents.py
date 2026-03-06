@@ -152,30 +152,50 @@ async def upload_document(
         db.add(document)
         await db.flush()   # populate document.id before creating chunks
 
-        # Chunk (section-aware because we pass the ParsedDocument)
-        # Embeddings will be generated separately in the concepts/extract step
-        chunker = ChunkingService()
-        chunks = await chunker.chunk_document(
-            parsed_doc,
-            metadata={"filename": file.filename},
-        )
+        # Small-doc fast path: skip chunking, store full text as one chunk
+        is_small = len(parsed_doc.full_text) <= settings.SMALL_DOC_CHAR_THRESHOLD
+        meta = dict(document.metadata_json or {})
+        meta["is_small_doc"] = is_small
+        document.metadata_json = meta
 
-        for chunk_data in chunks:
+        if is_small:
             db.add(
                 Chunk(
                     document_id=document.id,
-                    content=chunk_data["content"],
-                    chunk_index=chunk_data["chunk_index"],
-                    embedding=None,           # filled in by the embedding step
-                    metadata_json=chunk_data.get("metadata"),
+                    content=parsed_doc.full_text,
+                    chunk_index=0,
+                    embedding=None,
+                    metadata_json={"filename": file.filename, "whole_document": True},
                 )
             )
+            chunk_count = 1
+            logger.info(
+                "Small doc fast path: %r stored as id=%d with 1 whole-document chunk",
+                file.filename, document.id,
+            )
+        else:
+            chunker = ChunkingService()
+            chunks = await chunker.chunk_document(
+                parsed_doc,
+                metadata={"filename": file.filename},
+            )
+            for chunk_data in chunks:
+                db.add(
+                    Chunk(
+                        document_id=document.id,
+                        content=chunk_data["content"],
+                        chunk_index=chunk_data["chunk_index"],
+                        embedding=None,
+                        metadata_json=chunk_data.get("metadata"),
+                    )
+                )
+            chunk_count = len(chunks)
 
         await db.commit()
 
         logger.info(
             f"Document {file.filename!r} stored as id={document.id} "
-            f"with {len(chunks)} chunks."
+            f"with {chunk_count} chunks."
         )
 
         return DocumentUploadResponse(
@@ -185,7 +205,7 @@ async def upload_document(
             status="processed",
             message=(
                 f"Document uploaded and parsed successfully. "
-                f"{len(chunks)} chunks created."
+                f"{chunk_count} chunks created."
             ),
         )
 

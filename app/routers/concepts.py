@@ -360,10 +360,46 @@ async def get_concept_map(
     concept_res = await db.execute(
         select(Concept).where(Concept.project_id == settings.DEFAULT_PROJECT_ID)
     )
-    concepts: List[Concept] = list(concept_res.scalars().all())
+    all_concepts: List[Concept] = list(concept_res.scalars().all())
+
+    # Separate real concepts from synthetic gap nodes
+    real_concepts = [c for c in all_concepts if not c.is_gap]
+    gap_concepts  = [c for c in all_concepts if c.is_gap]
+
+    # --- Hard cap: keep top MAP_MAX_CONCEPT_NODES real concepts by importance ---
+    # Importance = coverage_score * 0.5 + generality_score * 0.5
+    # Cluster heads (parent_concept_id is None) are always preferred.
+    MAX_CONCEPT = getattr(settings, "MAP_MAX_CONCEPT_NODES", 20)
+    MAX_GAP     = getattr(settings, "MAP_MAX_GAP_NODES", 3)
+
+    if len(real_concepts) > MAX_CONCEPT:
+        def _concept_rank(c: Concept) -> float:
+            cov = c.coverage_score or 0.0
+            gen = c.generality_score or 0.0
+            is_head = 1.0 if c.parent_concept_id is None else 0.0
+            return cov * 0.4 + gen * 0.3 + is_head * 0.3
+
+        real_concepts = sorted(real_concepts, key=_concept_rank, reverse=True)[:MAX_CONCEPT]
+        logger.info(
+            "get_concept_map: capped %d real concepts → top %d by importance",
+            len(all_concepts) - len(gap_concepts),
+            MAX_CONCEPT,
+        )
+
+    # Cap gap nodes
+    if len(gap_concepts) > MAX_GAP:
+        _importance_order = {"critical": 0, "important": 1, "nice_to_have": 2}
+        gap_concepts = sorted(
+            gap_concepts,
+            key=lambda c: _importance_order.get(
+                (c.metadata_json or {}).get("importance", "important"), 1
+            ),
+        )[:MAX_GAP]
+
+    concepts: List[Concept] = real_concepts + gap_concepts
 
     # ---- Load relationships ----------------------------------------------
-    # Filtered to source concepts that belong to this project
+    # Filter to relationships where BOTH endpoints are in the capped concept set
     concept_ids_in_project = {c.id for c in concepts}
     rel_res = await db.execute(
         select(Relationship).where(

@@ -1,20 +1,21 @@
 """
 LLM-based extraction service for concepts, claims, and relationships.
 
-Uses Ollama's /api/generate endpoint with qwen2.5:3b (or whatever OLLAMA_LLM_MODEL
-is configured to).  All JSON prompts are stored as module-level constants so they
-can be tuned without touching logic code.
+Uses AWS Bedrock (Amazon Nova Lite) via the Converse API.  All JSON prompts
+are stored as module-level constants so they can be tuned without touching
+logic code.
 
 Public API
 ----------
-OllamaLLMService.extract_concepts(chunk_text, document_context) -> List[Dict]
-OllamaLLMService.extract_claims(chunk_text, concepts)           -> List[Dict]
-OllamaLLMService.extract_relationships(chunk_text, doc_title)   -> List[Dict]
-OllamaLLMService.process_document(document_id, db)             -> ExtractionSummary
+BedrockLLMService.extract_concepts(chunk_text, document_context) -> List[Dict]
+BedrockLLMService.extract_claims(chunk_text, concepts)           -> List[Dict]
+BedrockLLMService.extract_relationships(chunk_text, doc_title)   -> List[Dict]
+BedrockLLMService.process_document(document_id, db)             -> ExtractionSummary
 
 Backward compatibility
 ----------------------
-LLMExtractor = OllamaLLMService (alias)
+OllamaLLMService = BedrockLLMService (alias)
+LLMExtractor = BedrockLLMService (alias)
 _call_llm, analyze_relationships, generate_summary kept for brain_service.py
 extract_concepts(text) single-arg form kept for concepts.py router
 """
@@ -27,7 +28,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,7 +64,7 @@ class ExtractionSummary:
 # ---------------------------------------------------------------------------
 
 _CONCEPT_PROMPT = """\
-You are a research analyst extracting key concepts from academic text.
+You are a research analyst extracting HIGH-LEVEL topic concepts from academic text.
 
 Given the following text from a document titled "{document_title}":
 
@@ -70,18 +72,25 @@ Given the following text from a document titled "{document_title}":
 {chunk_text}
 ---
 
-Extract the key concepts discussed in this text. For each concept provide:
-1. concept_name: A clear, concise name (2-5 words)
-2. description: A brief description of what this concept means in context (1-2 sentences)
-3. specificity_level: Is this concept "broad" (e.g., "Machine Learning"), \
-"medium" (e.g., "Convolutional Neural Networks"), \
-or "specific" (e.g., "ResNet-50 skip connections")?
-4. confidence: How confident are you this is a real, distinct concept? (0.0 to 1.0)
+Extract the 2-3 most important HIGH-LEVEL research topics from this text.
 
-Extract between 3 and 8 concepts. Do not repeat the same concept twice.
+Rules:
+- Prefer BROAD topics (e.g. "Machine Learning", "Patient Privacy") over narrow ones \
+(e.g. "ResNet-50 skip connection optimization").
+- Do NOT extract methodology details, specific metrics, dataset names, or author names.
+- Think "chapter heading" level, not "bullet point" level.
+- Only extract concepts you are highly confident (≥ 0.80) are real, distinct research topics.
+
+For each concept provide:
+1. concept_name: A clear, concise name (2-5 words, title case)
+2. description: What this research topic is in context (1-2 sentences)
+3. specificity_level: "broad" (field-level) or "medium" (sub-field) — avoid "specific"
+4. confidence: How confident this is a real, distinct HIGH-LEVEL topic (0.0 to 1.0)
+
+Extract exactly 2-3 concepts. Do not repeat the same concept twice.
 
 Respond ONLY with valid JSON array. No explanation, no markdown:
-[{{"concept_name": "...", "description": "...", "specificity_level": "broad|medium|specific", "confidence": 0.9}}]\
+[{{"concept_name": "...", "description": "...", "specificity_level": "broad|medium", "confidence": 0.9}}]\
 """
 
 _CONCEPT_RETRY_PROMPT = """\
@@ -134,7 +143,7 @@ Return ONLY a JSON array — nothing else:
 """
 
 _COMBINED_PROMPT = """\
-You are a research analyst extracting key concepts AND specific claims from academic text.
+You are a research analyst extracting HIGH-LEVEL topic concepts and key claims from academic text.
 
 Given the following text from a document titled "{document_title}":
 
@@ -143,13 +152,54 @@ Given the following text from a document titled "{document_title}":
 ---
 
 Extract:
-1. **Concepts** (3-8): Key ideas discussed in this text. For each provide:
+1. **Concepts** (2-3 ONLY): The most important HIGH-LEVEL research topics in this text. For each:
+   - concept_name: A clear, concise name (2-5 words, title case)
+   - description: What this research topic means in context (1-2 sentences)
+   - specificity_level: "broad" (field-level) or "medium" (sub-field) — avoid "specific"
+   - confidence: How confident this is a HIGH-LEVEL topic worth tracking (0.0-1.0)
+
+   Rules for concepts:
+   - Prefer BROAD topics over narrow ones (think chapter headings, not bullet points)
+   - Do NOT extract: methodology details, specific metrics, dataset names, model names
+   - Only include concepts with confidence ≥ 0.80
+
+2. **Claims** (2-4): The most important assertions made about the concepts. For each:
+   - claim_text: The specific claim in one clear sentence
+   - related_concept: Which concept name from above this claim relates to (exact match)
+   - claim_type: "supports", "contradicts", "extends", or "complements"
+   - confidence: How explicitly stated (0.0 = implied, 1.0 = explicit)
+
+Respond ONLY with valid JSON. No explanation, no markdown:
+{{"concepts": [{{"concept_name": "...", "description": "...", "specificity_level": "broad|medium", "confidence": 0.9}}], "claims": [{{"claim_text": "...", "related_concept": "...", "claim_type": "supports", "confidence": 0.8}}]}}\
+"""
+
+_COMBINED_RETRY_PROMPT = """\
+Extract concepts and claims from this academic text as JSON.
+
+Text:
+{chunk_text}
+
+Return ONLY a JSON object — nothing else, no markdown:
+{{"concepts": [{{"concept_name": "Example", "description": "One sentence.", "specificity_level": "medium", "confidence": 0.8}}], "claims": [{{"claim_text": "A specific assertion.", "related_concept": "Example", "claim_type": "supports", "confidence": 0.8}}]}}\
+"""
+
+_WHOLE_DOC_PROMPT = """\
+You are a research analyst extracting key concepts AND specific claims from a complete academic document.
+
+Document title: "{document_title}"
+
+---
+{document_text}
+---
+
+Extract:
+1. **Concepts** ({min_concepts}-{max_concepts}): The most important ideas in this document. For each provide:
    - concept_name: A clear, concise name (2-5 words)
    - description: What this concept means in context (1-2 sentences)
    - specificity_level: "broad", "medium", or "specific"
    - confidence: How confident this is a real, distinct concept (0.0-1.0)
 
-2. **Claims** (2-6): Specific assertions made about the concepts. For each provide:
+2. **Claims** (3-8): The most important assertions made about the concepts. For each provide:
    - claim_text: The specific claim in one clear sentence
    - related_concept: Which concept name from above this claim relates to (exact match)
    - claim_type: "supports", "contradicts", "extends", or "complements"
@@ -159,11 +209,11 @@ Respond ONLY with valid JSON. No explanation, no markdown:
 {{"concepts": [{{"concept_name": "...", "description": "...", "specificity_level": "medium", "confidence": 0.9}}], "claims": [{{"claim_text": "...", "related_concept": "...", "claim_type": "supports", "confidence": 0.8}}]}}\
 """
 
-_COMBINED_RETRY_PROMPT = """\
-Extract concepts and claims from this academic text as JSON.
+_WHOLE_DOC_RETRY_PROMPT = """\
+Extract concepts and claims from this document as JSON.
 
 Text:
-{chunk_text}
+{document_text}
 
 Return ONLY a JSON object — nothing else, no markdown:
 {{"concepts": [{{"concept_name": "Example", "description": "One sentence.", "specificity_level": "medium", "confidence": 0.8}}], "claims": [{{"claim_text": "A specific assertion.", "related_concept": "Example", "claim_type": "supports", "confidence": 0.8}}]}}\
@@ -224,18 +274,18 @@ def _to_float_list(value: Any) -> List[float]:
 # Main service class
 # ---------------------------------------------------------------------------
 
-class OllamaLLMService:
+class BedrockLLMService:
     """
-    LLM extraction service via Ollama /api/generate.
+    LLM extraction service via AWS Bedrock (Amazon Nova Lite, Converse API).
 
     Limits concurrency to MAX_CONCURRENT simultaneous LLM calls.
     Retries JSON parsing up to MAX_JSON_RETRIES times with a simpler prompt.
-    Handles qwen2.5:3b's tendency to wrap JSON in markdown code fences.
+    Handles LLM tendency to wrap JSON in markdown code fences.
     """
 
     MAX_CONCURRENT: int = 2
     MAX_JSON_RETRIES: int = 2
-    LLM_TIMEOUT: float = float(settings.OLLAMA_TIMEOUT)  # default 300s from config
+    LLM_TIMEOUT: float = float(settings.AWS_BEDROCK_TIMEOUT)
     MIN_CHUNK_WORDS: int = 50    # chunks shorter than this are skipped
 
     SPECIFICITY_TO_GENERALITY: Dict[str, float] = {
@@ -257,12 +307,18 @@ class OllamaLLMService:
     COMBINED_RETRY_PROMPT = _COMBINED_RETRY_PROMPT
     RELATIONSHIP_PROMPT = _RELATIONSHIP_PROMPT
     RELATIONSHIP_RETRY_PROMPT = _RELATIONSHIP_RETRY_PROMPT
+    WHOLE_DOC_PROMPT = _WHOLE_DOC_PROMPT
+    WHOLE_DOC_RETRY_PROMPT = _WHOLE_DOC_RETRY_PROMPT
 
     def __init__(self) -> None:
-        self.base_url = settings.OLLAMA_BASE_URL
-        self.model = settings.OLLAMA_LLM_MODEL
-        self.timeout = httpx.Timeout(self.LLM_TIMEOUT, connect=10.0)
+        self.model = settings.AWS_BEDROCK_LLM_MODEL
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        self._client = boto3.client(
+            "bedrock-runtime",
+            region_name=settings.AWS_REGION,
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        )
 
     # ------------------------------------------------------------------
     # Public extraction methods
@@ -494,6 +550,103 @@ class OllamaLLMService:
         )
         return concepts, claims
 
+    async def extract_whole_document(
+        self,
+        document_text: str,
+        document_context: str = "",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Extract concepts AND claims from a complete small document in a
+        single LLM call.  No 3000-char truncation — small docs are
+        <= SMALL_DOC_CHAR_THRESHOLD (8000 chars), well within context limits.
+
+        Returns ``(concepts_list, claims_list)`` — same format as
+        ``extract_concepts_and_claims``.
+        """
+        if self._is_too_short(document_text):
+            return [], []
+
+        document_title = document_context.strip() or "Unknown Document"
+
+        prompt = self.WHOLE_DOC_PROMPT.format(
+            document_title=document_title,
+            document_text=document_text,
+            min_concepts=settings.SMALL_DOC_MIN_CONCEPTS,
+            max_concepts=settings.SMALL_DOC_MAX_CONCEPTS,
+        )
+        retry_prompt = self.WHOLE_DOC_RETRY_PROMPT.format(document_text=document_text)
+
+        success, raw = await self._call_llm_json(prompt, max_tokens=2000, retry_prompt=retry_prompt)
+        if not success or not isinstance(raw, dict):
+            return [], []
+
+        # --- parse concepts (same logic as extract_concepts_and_claims) ---
+        raw_concepts = raw.get("concepts", [])
+        if not isinstance(raw_concepts, list):
+            raw_concepts = [raw_concepts] if isinstance(raw_concepts, dict) else []
+
+        seen: set = set()
+        concepts: List[Dict[str, Any]] = []
+
+        for item in raw_concepts:
+            if not isinstance(item, dict):
+                continue
+
+            name = str(item.get("concept_name", "")).strip()
+            if not name:
+                continue
+
+            norm = clean_concept_name(name)
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            specificity = str(item.get("specificity_level", "medium")).lower()
+            if specificity not in self.VALID_SPECIFICITY:
+                specificity = "medium"
+
+            concepts.append({
+                "name": name,
+                "concept_name": name,
+                "description": str(item.get("description", "")).strip(),
+                "specificity_level": specificity,
+                "generality_score": self.SPECIFICITY_TO_GENERALITY[specificity],
+                "confidence": self._clamp(item.get("confidence", 0.7)),
+            })
+
+        # --- parse claims ---
+        raw_claims = raw.get("claims", [])
+        if not isinstance(raw_claims, list):
+            raw_claims = [raw_claims] if isinstance(raw_claims, dict) else []
+
+        claims: List[Dict[str, Any]] = []
+        for item in raw_claims:
+            if not isinstance(item, dict):
+                continue
+
+            claim_text = str(item.get("claim_text", "")).strip()
+            if not claim_text:
+                continue
+
+            claim_type = str(item.get("claim_type", "supports")).lower().strip()
+            if claim_type not in self.VALID_CLAIM_TYPES:
+                claim_type = "supports"
+
+            claims.append({
+                "claim_text": claim_text,
+                "related_concept": str(item.get("related_concept", "")).strip(),
+                "claim_type": claim_type,
+                "confidence": self._clamp(item.get("confidence", 0.7)),
+            })
+
+        logger.info(
+            "extract_whole_document: %d concepts, %d claims from document '%s'",
+            len(concepts),
+            len(claims),
+            document_title,
+        )
+        return concepts, claims
+
     async def extract_relationships(
         self,
         chunk_text: str,
@@ -554,32 +707,158 @@ class OllamaLLMService:
     # Full document extraction pipeline
     # ------------------------------------------------------------------
 
+    async def _deduplicate_and_save(
+        self,
+        all_raw_concepts: List[Tuple[Dict, int]],
+        all_raw_claims: List[Tuple[Dict, int]],
+        document_id: int,
+        document: "Document",
+        existing_concepts: list,
+        existing_by_name: Dict[str, "Concept"],
+        db: AsyncSession,
+    ) -> Tuple[int, int]:
+        """
+        Deduplicate raw concepts against existing project concepts and
+        persist new Concept + Claim rows.
+
+        Returns ``(new_concepts_count, claims_saved)``.
+        """
+        from app.services.embedding import BedrockEmbeddingService as _EmbSvc
+
+        embedding_svc = _EmbSvc()
+
+        batch_concept_map: Dict[str, Concept] = {}
+        new_concepts_count = 0
+
+        for concept_dict, _chunk_id in all_raw_concepts:
+            concept_name: str = concept_dict["concept_name"]
+            norm = clean_concept_name(concept_name)
+            if not norm:
+                continue
+
+            # Drop low-confidence extractions before they reach the DB
+            if concept_dict.get("confidence", 0.7) < settings.MIN_CONCEPT_CONFIDENCE:
+                logger.debug(
+                    "Dropping low-confidence concept '%s' (%.2f < %.2f)",
+                    concept_name,
+                    concept_dict.get("confidence", 0.7),
+                    settings.MIN_CONCEPT_CONFIDENCE,
+                )
+                continue
+
+            if norm in batch_concept_map:
+                continue
+
+            if norm in existing_by_name:
+                batch_concept_map[norm] = existing_by_name[norm]
+                continue
+
+            embed_input = f"{concept_name} {concept_dict.get('description', '')}".strip()
+            embedding = await embedding_svc.embed_text(embed_input)
+
+            matched: Optional[Concept] = None
+            if embedding:
+                emb_list = list(embedding)
+                for existing_c in existing_concepts:
+                    existing_emb = _to_float_list(existing_c.embedding)
+                    if not existing_emb:
+                        continue
+                    try:
+                        sim = cosine_similarity(emb_list, existing_emb)
+                        if sim >= settings.CONCEPT_SIMILARITY_THRESHOLD:
+                            matched = existing_c
+                            logger.debug(
+                                "Concept '%s' deduplicated → '%s' (cos=%.3f)",
+                                concept_name,
+                                existing_c.name,
+                                sim,
+                            )
+                            break
+                    except ValueError:
+                        continue
+
+            if matched is not None:
+                batch_concept_map[norm] = matched
+                existing_by_name[norm] = matched
+                continue
+
+            new_concept = Concept(
+                project_id=document.project_id,
+                name=concept_name,
+                description=concept_dict.get("description", ""),
+                generality_score=concept_dict.get("generality_score", 0.5),
+                coverage_score=0.5,
+                consensus_score=1.0,
+                embedding=embedding,
+                metadata_json={
+                    "specificity_level": concept_dict.get("specificity_level", "medium"),
+                    "extraction_confidence": concept_dict.get("confidence", 0.7),
+                    "source_document_id": document_id,
+                },
+            )
+            db.add(new_concept)
+            await db.flush()
+
+            batch_concept_map[norm] = new_concept
+            existing_by_name[norm] = new_concept
+            existing_concepts.append(new_concept)
+            new_concepts_count += 1
+
+        # --- save claims ---
+        claims_saved = 0
+        for claim_dict, _chunk_id in all_raw_claims:
+            related_name = claim_dict.get("related_concept", "")
+            norm_related = clean_concept_name(related_name)
+
+            concept_obj = batch_concept_map.get(norm_related)
+
+            if concept_obj is None and norm_related:
+                for bname, bobj in batch_concept_map.items():
+                    if norm_related in bname or bname in norm_related:
+                        concept_obj = bobj
+                        break
+
+            if concept_obj is None:
+                logger.debug(
+                    "Cannot resolve concept '%s' for claim — skipping", related_name
+                )
+                continue
+
+            try:
+                claim_type_enum = ClaimType(claim_dict["claim_type"])
+            except (KeyError, ValueError):
+                claim_type_enum = ClaimType.SUPPORTS
+
+            db.add(
+                Claim(
+                    document_id=document_id,
+                    concept_id=concept_obj.id,
+                    claim_text=claim_dict["claim_text"],
+                    claim_type=claim_type_enum,
+                    confidence=claim_dict.get("confidence", 0.7),
+                )
+            )
+            claims_saved += 1
+
+        return new_concepts_count, claims_saved
+
     async def process_document(
         self,
         document_id: int,
         db: AsyncSession,
     ) -> ExtractionSummary:
         """
-        Run the full extraction pipeline for a document:
+        Run the full extraction pipeline for a document.
 
-        1. Load all chunks for the document.
-        2. For each non-trivial chunk:
-           a. extract_concepts
-           b. extract_claims (anchored to extracted concepts)
-           c. extract_relationships
-        3. Deduplicate concepts:
-           - exact name match (normalised) against existing project concepts
-           - embedding cosine similarity ≥ 0.85 against existing embeddings
-        4. Persist new Concept rows; embed each new concept.
-        5. Persist Claim rows (linking document ↔ concept).
-        6. Return ExtractionSummary.
+        **Small-doc fast path:** if the document has ``is_small_doc=True``
+        in its metadata, a single whole-document LLM call is used instead
+        of per-chunk extraction.
 
-        Note: concepts are project-scoped, not document-scoped.  Concepts
-        already in the DB (from other documents) will be reused.
+        **Normal path:** per-chunk extraction with 3-5 concepts per chunk.
+
+        Both paths share the same dedup + save logic via
+        ``_deduplicate_and_save``.
         """
-        # Import here to avoid circular imports at module load time
-        from app.services.embedding import OllamaEmbeddingService
-
         # --- load document ---
         doc_result = await db.execute(
             select(Document).where(Document.id == document_id)
@@ -617,18 +896,88 @@ class OllamaLLMService:
                 Concept.project_id == document.project_id
             )
         )
-        existing_concepts = existing_result.scalars().all()
-        # normalised_name → Concept ORM object
+        existing_concepts = list(existing_result.scalars().all())
         existing_by_name: Dict[str, Concept] = {
             clean_concept_name(c.name): c
             for c in existing_concepts
             if c.name
         }
 
-        embedding_svc = OllamaEmbeddingService()
+        meta = document.metadata_json or {}
+        is_small = meta.get("is_small_doc", False)
 
-        # --- per-chunk extraction (with resume support) ---
-        # Filter out chunks that were already extracted in a previous run
+        # =================================================================
+        # Small-doc fast path: single whole-document LLM call
+        # =================================================================
+        if is_small and document.content_text:
+            logger.info(
+                "process_document %d: small-doc fast path (whole-document extraction)",
+                document_id,
+            )
+
+            all_raw_concepts: List[Tuple[Dict, int]] = []
+            all_raw_claims: List[Tuple[Dict, int]] = []
+            errors: List[str] = []
+
+            # Check if already extracted (resume support)
+            chunk = chunks[0]
+            if chunk.extraction_status in ("extracted", "skipped"):
+                logger.info(
+                    "process_document %d: small doc already extracted — skipping",
+                    document_id,
+                )
+                return ExtractionSummary(
+                    document_id=document_id,
+                    document_title=document_title,
+                    chunks_processed=1,
+                    chunks_skipped=0,
+                    concepts_extracted=0,
+                    concepts_saved=0,
+                    claims_saved=0,
+                    relationships_found=0,
+                    errors=[],
+                )
+
+            try:
+                concepts, claims = await self.extract_whole_document(
+                    document.content_text, document_title
+                )
+                for c in concepts:
+                    all_raw_concepts.append((c, chunk.id))
+                for cl in claims:
+                    all_raw_claims.append((cl, chunk.id))
+                chunk.extraction_status = "extracted"
+            except Exception as exc:
+                msg = f"Whole-doc extraction: {exc}"
+                errors.append(msg)
+                logger.error("process_document error — %s", msg, exc_info=True)
+
+            new_concepts_count, claims_saved = await self._deduplicate_and_save(
+                all_raw_concepts, all_raw_claims,
+                document_id, document,
+                existing_concepts, existing_by_name, db,
+            )
+            await db.commit()
+
+            logger.info(
+                "process_document %d (small): %d concepts, %d claims",
+                document_id, new_concepts_count, claims_saved,
+            )
+            return ExtractionSummary(
+                document_id=document_id,
+                document_title=document_title,
+                chunks_processed=1,
+                chunks_skipped=0,
+                concepts_extracted=len(all_raw_concepts),
+                concepts_saved=new_concepts_count,
+                claims_saved=claims_saved,
+                relationships_found=0,
+                errors=errors,
+            )
+
+        # =================================================================
+        # Normal path: per-chunk extraction
+        # =================================================================
         chunks_to_process = [
             c for c in chunks
             if c.extraction_status not in ("extracted", "skipped")
@@ -642,8 +991,8 @@ class OllamaLLMService:
 
         chunks_processed = already_extracted
         chunks_skipped = 0
-        all_raw_concepts: List[Tuple[Dict, int]] = []   # (concept_dict, chunk_id)
-        all_raw_claims: List[Tuple[Dict, int]] = []     # (claim_dict, chunk_id)
+        all_raw_concepts: List[Tuple[Dict, int]] = []
+        all_raw_claims: List[Tuple[Dict, int]] = []
         errors: List[str] = []
 
         for chunk in chunks_to_process:
@@ -658,7 +1007,6 @@ class OllamaLLMService:
                 continue
 
             try:
-                # Combined prompt: 1 LLM call per chunk instead of 2
                 concepts, claims = await self.extract_concepts_and_claims(
                     chunk.content, document_title
                 )
@@ -685,122 +1033,11 @@ class OllamaLLMService:
                 logger.error("process_document error — %s", msg, exc_info=True)
                 chunks_skipped += 1
 
-        # --- deduplicate + save concepts ---
-        #
-        # batch_concept_map: normalised_name → Concept ORM object
-        # Tracks both pre-existing concepts (reused) and newly created ones.
-        batch_concept_map: Dict[str, Concept] = {}
-        new_concepts_count = 0
-
-        for concept_dict, _chunk_id in all_raw_concepts:
-            concept_name: str = concept_dict["concept_name"]
-            norm = clean_concept_name(concept_name)
-            if not norm:
-                continue
-
-            # Already handled in this extraction run?
-            if norm in batch_concept_map:
-                continue
-
-            # Exact name match against existing DB concepts?
-            if norm in existing_by_name:
-                batch_concept_map[norm] = existing_by_name[norm]
-                continue
-
-            # New concept — embed it so we can check embedding similarity
-            embed_input = f"{concept_name} {concept_dict.get('description', '')}".strip()
-            embedding = await embedding_svc.embed_text(embed_input)
-
-            # Embedding-based deduplication vs. existing concepts
-            # O(N) per new concept — acceptable for typical collection sizes.
-            matched: Optional[Concept] = None
-            if embedding:
-                emb_list = list(embedding)
-                for existing_c in existing_concepts:
-                    existing_emb = _to_float_list(existing_c.embedding)
-                    if not existing_emb:
-                        continue
-                    try:
-                        sim = cosine_similarity(emb_list, existing_emb)
-                        if sim >= 0.85:
-                            matched = existing_c
-                            logger.debug(
-                                "Concept '%s' deduplicated → '%s' (cos=%.3f)",
-                                concept_name,
-                                existing_c.name,
-                                sim,
-                            )
-                            break
-                    except ValueError:
-                        continue   # dimension mismatch — skip
-
-            if matched is not None:
-                batch_concept_map[norm] = matched
-                existing_by_name[norm] = matched
-                continue
-
-            # Genuinely new — persist to DB
-            new_concept = Concept(
-                project_id=document.project_id,
-                name=concept_name,
-                description=concept_dict.get("description", ""),
-                generality_score=concept_dict.get("generality_score", 0.5),
-                coverage_score=0.5,
-                consensus_score=1.0,
-                embedding=embedding,
-                metadata_json={
-                    "specificity_level": concept_dict.get("specificity_level", "medium"),
-                    "extraction_confidence": concept_dict.get("confidence", 0.7),
-                    "source_document_id": document_id,
-                },
-            )
-            db.add(new_concept)
-            await db.flush()  # obtain auto-generated id immediately
-
-            batch_concept_map[norm] = new_concept
-            existing_by_name[norm] = new_concept
-            existing_concepts.append(new_concept)  # include in future similarity checks
-            new_concepts_count += 1
-
-        # --- save claims ---
-        claims_saved = 0
-        for claim_dict, _chunk_id in all_raw_claims:
-            related_name = claim_dict.get("related_concept", "")
-            norm_related = clean_concept_name(related_name)
-
-            # Resolve concept — exact match first
-            concept_obj = batch_concept_map.get(norm_related)
-
-            # Fuzzy fallback: substring containment
-            if concept_obj is None and norm_related:
-                for bname, bobj in batch_concept_map.items():
-                    if norm_related in bname or bname in norm_related:
-                        concept_obj = bobj
-                        break
-
-            if concept_obj is None:
-                logger.debug(
-                    "Cannot resolve concept '%s' for claim — skipping", related_name
-                )
-                continue
-
-            # Map to DB enum (values are already validated as supports/contradicts/…)
-            try:
-                claim_type_enum = ClaimType(claim_dict["claim_type"])
-            except (KeyError, ValueError):
-                claim_type_enum = ClaimType.SUPPORTS
-
-            db.add(
-                Claim(
-                    document_id=document_id,
-                    concept_id=concept_obj.id,
-                    claim_text=claim_dict["claim_text"],
-                    claim_type=claim_type_enum,
-                    confidence=claim_dict.get("confidence", 0.7),
-                )
-            )
-            claims_saved += 1
-
+        new_concepts_count, claims_saved = await self._deduplicate_and_save(
+            all_raw_concepts, all_raw_claims,
+            document_id, document,
+            existing_concepts, existing_by_name, db,
+        )
         await db.commit()
 
         summary = ExtractionSummary(
@@ -811,7 +1048,7 @@ class OllamaLLMService:
             concepts_extracted=len(all_raw_concepts),
             concepts_saved=new_concepts_count,
             claims_saved=claims_saved,
-            relationships_found=0,  # relationships detected at project level, not per-chunk
+            relationships_found=0,
             errors=errors,
         )
         logger.info(
@@ -830,77 +1067,44 @@ class OllamaLLMService:
 
     async def _call_llm(self, prompt: str, max_tokens: int = 1000) -> str:
         """
-        Dispatch to Groq (if GROQ_API is set) or local Ollama.
+        Call AWS Bedrock (Nova Lite) via the Converse API.
 
         Uses semaphore to cap concurrent LLM calls.  Returns empty string
-        on any error (timeout, connection failure, non-200 response).
+        on any error (timeout, connection failure, throttling).
         """
         async with self._semaphore:
-            if settings.GROQ_API:
-                return await self._call_groq(prompt, max_tokens)
-            return await self._call_ollama(prompt, max_tokens)
+            return await self._call_bedrock(prompt, max_tokens)
 
-    async def _call_groq(self, prompt: str, max_tokens: int = 1000) -> str:
-        """POST to Groq chat completions (OpenAI-compatible) and return the text."""
+    async def _call_bedrock(self, prompt: str, max_tokens: int = 1000) -> str:
+        """Call Bedrock Nova Lite via the Converse API and return the text."""
         try:
-            timeout = httpx.Timeout(float(settings.GROQ_TIMEOUT), connect=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.GROQ_API}"},
-                    json={
-                        "model": settings.GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
+            def _invoke():
+                resp = self._client.converse(
+                    modelId=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": [{"text": prompt}],
+                    }],
+                    inferenceConfig={
+                        "maxTokens": max_tokens,
                         "temperature": 0.1,
                     },
                 )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"]
-            logger.error(
-                "_call_groq: HTTP %d: %s", resp.status_code, resp.text[:300]
-            )
-            return ""
-        except httpx.TimeoutException:
-            logger.error("_call_groq: timed out after %.0fs", float(settings.GROQ_TIMEOUT))
-            return ""
-        except httpx.ConnectError as exc:
-            logger.error("_call_groq: connection error — %s", exc)
-            return ""
-        except Exception as exc:
-            logger.error("_call_groq: unexpected error — %s", exc)
-            return ""
+                return resp["output"]["message"]["content"][0]["text"]
 
-    async def _call_ollama(self, prompt: str, max_tokens: int = 1000) -> str:
-        """POST to local Ollama /api/generate and return the response text."""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "num_predict": max_tokens,
-                            "temperature": 0.1,
-                        },
-                    },
-                )
-            if resp.status_code == 200:
-                return resp.json().get("response", "")
-            logger.error(
-                "_call_ollama: HTTP %d: %s", resp.status_code, resp.text[:300]
-            )
+            return await asyncio.to_thread(_invoke)
+        except EndpointConnectionError as exc:
+            logger.error("_call_bedrock: connection error — %s", exc)
             return ""
-        except httpx.TimeoutException:
-            logger.error("_call_ollama: timed out after %.0fs", self.LLM_TIMEOUT)
-            return ""
-        except httpx.ConnectError as exc:
-            logger.error("_call_ollama: connection error — %s", exc)
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code == "ThrottlingException":
+                logger.error("_call_bedrock: throttled — %s", exc)
+            else:
+                logger.error("_call_bedrock: client error — %s", exc)
             return ""
         except Exception as exc:
-            logger.error("_call_ollama: unexpected error — %s", exc)
+            logger.error("_call_bedrock: unexpected error — %s", exc)
             return ""
 
     async def _call_llm_json(
@@ -1172,6 +1376,7 @@ class OllamaLLMService:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatibility alias — existing imports use `LLMExtractor`
+# Backward-compatibility aliases — existing imports use these names
 # ---------------------------------------------------------------------------
-LLMExtractor = OllamaLLMService
+OllamaLLMService = BedrockLLMService
+LLMExtractor = BedrockLLMService

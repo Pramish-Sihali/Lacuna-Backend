@@ -8,7 +8,6 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-import httpx
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -44,56 +43,26 @@ async def _check_database() -> bool:
         raise
 
 
-async def _check_ollama() -> dict:
+async def _check_bedrock() -> dict:
     """
-    Verify Ollama is reachable and check that the required models are available.
+    Verify AWS Bedrock is reachable by running a test embedding.
     Returns a dict with status info.  Never raises — warnings are logged instead.
     """
-    result = {"reachable": False, "embed_model": False, "llm_model": False, "models": []}
+    result = {"reachable": False, "embed_model": settings.AWS_BEDROCK_EMBED_MODEL, "llm_model": settings.AWS_BEDROCK_LLM_MODEL}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_BASE_URL}/api/tags")
-        if resp.status_code != 200:
-            logger.warning("⚠ Ollama responded with status %d", resp.status_code)
-            return result
-
-        result["reachable"] = True
-        available = [m["name"] for m in resp.json().get("models", [])]
-        result["models"] = available
-        logger.info("✓ Ollama reachable — available models: %s", available)
-
-        # Check embed model (partial match so "nomic-embed-text:latest" still matches)
-        embed_model = settings.OLLAMA_EMBED_MODEL
-        result["embed_model"] = any(
-            m == embed_model or m.startswith(embed_model.split(":")[0])
-            for m in available
-        )
-        if result["embed_model"]:
-            logger.info("  ✓ Embedding model '%s' is available", embed_model)
+        from app.services.embedding import BedrockEmbeddingService
+        svc = BedrockEmbeddingService()
+        is_healthy = await svc.check_bedrock_health()
+        if is_healthy:
+            result["reachable"] = True
+            logger.info("✓ AWS Bedrock reachable")
+            logger.info("  ✓ Embedding model: %s", settings.AWS_BEDROCK_EMBED_MODEL)
+            logger.info("  ✓ LLM model: %s", settings.AWS_BEDROCK_LLM_MODEL)
         else:
-            logger.warning(
-                "  ⚠ Embedding model '%s' not found — run: ollama pull %s",
-                embed_model,
-                embed_model,
-            )
-
-        llm_model = settings.OLLAMA_LLM_MODEL
-        result["llm_model"] = any(
-            m == llm_model or m.startswith(llm_model.split(":")[0])
-            for m in available
-        )
-        if result["llm_model"]:
-            logger.info("  ✓ LLM model '%s' is available", llm_model)
-        else:
-            logger.warning(
-                "  ⚠ LLM model '%s' not found — run: ollama pull %s",
-                llm_model,
-                llm_model,
-            )
-
+            logger.warning("⚠ AWS Bedrock health check returned unhealthy")
     except Exception as exc:
         logger.error(
-            "✗ Ollama unreachable (%s) — embedding and LLM features will fail", exc
+            "✗ AWS Bedrock unreachable (%s) — embedding and LLM features will fail", exc
         )
     return result
 
@@ -112,12 +81,12 @@ async def lifespan(app: FastAPI):
     # 1 — Database (required; raises on failure)
     await _check_database()
 
-    # 2 — Ollama (optional; logs warnings but continues)
-    ollama_status = await _check_ollama()
-    if not ollama_status["reachable"]:
+    # 2 — AWS Bedrock (optional; logs warnings but continues)
+    bedrock_status = await _check_bedrock()
+    if not bedrock_status["reachable"]:
         logger.warning(
-            "Ollama is not running.  Start it with: ollama serve\n"
-            "  Embedding and LLM features will be unavailable until Ollama is up."
+            "AWS Bedrock is not reachable.  Check your AWS credentials and region.\n"
+            "  Embedding and LLM features will be unavailable until Bedrock is accessible."
         )
 
     # 3 — Upload directory

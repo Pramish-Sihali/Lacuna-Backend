@@ -499,11 +499,26 @@ class LacunaPipeline:
         # ── Phase 1: Embed documents ──────────────────────────────────
         # embed_document_chunks already skips chunks with existing embeddings,
         # but we skip the whole doc if all chunks are already embedded.
+        # Small docs with embedding_skipped=True are also skipped directly.
         if documents:
             status.phase = PipelinePhase.EMBEDDING
             for doc in documents:
                 async with AsyncSessionLocal() as session:
                     try:
+                        # Resume: check if small doc already had embedding skipped
+                        doc_result = await session.execute(
+                            select(Document).where(Document.id == doc.id)
+                        )
+                        fresh_doc = doc_result.scalar_one_or_none()
+                        doc_meta = (fresh_doc.metadata_json or {}) if fresh_doc else {}
+                        if doc_meta.get("is_small_doc") and doc_meta.get("embedding_skipped"):
+                            logger.info(
+                                "process_all_phased: small doc %d — embedding already skipped, moving on",
+                                doc.id,
+                            )
+                            status.documents_embedded += 1
+                            continue
+
                         # Resume: check if doc already fully embedded
                         unembedded = await session.execute(
                             select(func.count(Chunk.id)).where(
